@@ -12,6 +12,7 @@
 #include <vector>
 #include <chrono>
 #include <memory>
+#include <algorithm>
 #include <absl/flags/flag.h>
 #include <fmt/format.h>
 
@@ -39,6 +40,10 @@ struct Stats {
     std::atomic<uint64_t> total_latency_us{0};
     std::atomic<uint64_t> min_latency_us{UINT64_MAX};
     std::atomic<uint64_t> max_latency_us{0};
+
+    // For percentile calculations
+    absl::Mutex latencies_mu;
+    std::vector<uint64_t> latencies ABSL_GUARDED_BY(latencies_mu);
 };
 
 class StressGateway : public uv::Base {
@@ -265,6 +270,12 @@ private:
                     uint64_t current_max = stats->max_latency_us.load();
                     while (latency_us > current_max &&
                            !stats->max_latency_us.compare_exchange_weak(current_max, latency_us));
+
+                    // Store latency for percentile calculation
+                    {
+                        absl::MutexLock lock(&stats->latencies_mu);
+                        stats->latencies.push_back(latency_us);
+                    }
                 }
 
                 stats->responses_received++;
@@ -401,6 +412,21 @@ void PrintStats(Stats* stats, int duration_sec) {
 
     double throughput = static_cast<double>(total_received) / duration_sec;
 
+    // Calculate 99th percentile
+    uint64_t p99_latency = 0;
+    {
+        absl::MutexLock lock(&stats->latencies_mu);
+        if (!stats->latencies.empty()) {
+            std::vector<uint64_t> sorted_latencies = stats->latencies;
+            std::sort(sorted_latencies.begin(), sorted_latencies.end());
+            size_t p99_index = (sorted_latencies.size() * 99) / 100;
+            if (p99_index >= sorted_latencies.size()) {
+                p99_index = sorted_latencies.size() - 1;
+            }
+            p99_latency = sorted_latencies[p99_index];
+        }
+    }
+
     LOG(INFO) << "=== Benchmark Results ===";
     LOG(INFO) << "Duration: " << duration_sec << " seconds";
     LOG(INFO) << "Total requests sent: " << total_sent;
@@ -411,6 +437,7 @@ void PrintStats(Stats* stats, int duration_sec) {
     if (min_latency != UINT64_MAX) {
         LOG(INFO) << "Min latency: " << min_latency << " μs";
     }
+    LOG(INFO) << "P99 latency: " << p99_latency << " μs";
     LOG(INFO) << "Max latency: " << max_latency << " μs";
     if (total_sent > 0) {
         LOG(INFO) << "Success rate: "
