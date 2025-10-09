@@ -44,7 +44,7 @@ $NIGHTCORE_ROOT/bin/$BUILD_TYPE/stress_client \
     --duration_sec=$DURATION \
     --target_rps=$TARGET_RPS \
     --func_id=1 \
-    --v=1 2>$BASE_DIR/outputs/stress_client.log &
+    --v=0 2>&1 &
 STRESS_CLIENT_PID=$!
 
 echo "Waiting for stress_client to start listening..."
@@ -57,7 +57,7 @@ $NIGHTCORE_ROOT/bin/$BUILD_TYPE/engine \
     --node_id=0 \
     --gateway_addr=127.0.0.1 \
     --gateway_port=10007 \
-    --v=1 2>$BASE_DIR/outputs/engine.log &
+    --v=0 2>/dev/null &
 ENGINE_PID=$!
 
 sleep 2
@@ -68,7 +68,7 @@ $NIGHTCORE_ROOT/bin/$BUILD_TYPE/launcher \
     --func_id=1 --fprocess_mode=cpp \
     --fprocess_output_dir=$BASE_DIR/outputs \
     --fprocess="$NIGHTCORE_ROOT/bin/$BUILD_TYPE/func_worker_v1 $BASE_DIR/libnoop.so" \
-    --v=1 2>$BASE_DIR/outputs/launcher.log &
+    --v=0 2>/dev/null &
 LAUNCHER_PID=$!
 
 echo "All components started. Waiting for workers to initialize and load test to run..."
@@ -94,14 +94,7 @@ kill -9 $LAUNCHER_PID 2>/dev/null
 kill -9 $ENGINE_PID 2>/dev/null
 
 echo ""
-echo "=== Log files ==="
-echo "Stress client log: $BASE_DIR/outputs/stress_client.log"
-echo "Engine log: $BASE_DIR/outputs/engine.log"
-echo "Launcher log: $BASE_DIR/outputs/launcher.log"
-echo "Worker logs: $BASE_DIR/outputs/Noop_worker_*.stdout"
-
-echo ""
-echo "=== Engine Statistics ==="
-grep -E "incoming_requests|request_interval|dispatch_overhead|processing_time" $BASE_DIR/outputs/engine.log | tail -30 || echo "No stats found"
+echo "NOTE: Engine and Launcher logs suppressed for performance (2>/dev/null)"
+echo "Worker stdout/stderr (if any): $BASE_DIR/outputs/Noop_worker_*.stdout"
 
 exit $BENCH_EXIT_CODE
