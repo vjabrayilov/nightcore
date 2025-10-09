@@ -232,10 +232,10 @@ private:
     }
 
     inline T percentile(double p) {
-        size_t idx = gsl::narrow_cast<size_t>(samples_.size() * p + 0.5);
-        if (idx < 0) idx = 0;
-        if (idx >= samples_.size()) {
-            idx = samples_.size() - 1;
+      size_t idx =
+          gsl::narrow_cast<size_t>(std::max(0.0, samples_.size() * p + 0.5));
+      if (idx >= samples_.size()) {
+        idx = samples_.size() - 1;
         }
         return samples_[idx];
     }
