@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fcntl.h>
+#include <mutex>
 #include <signal.h>
 #include <thread>
 #include <unistd.h>
@@ -51,6 +52,41 @@ struct ConnectionStats {
 };
 
 class StressClient;
+class EngineConnection;
+
+namespace {
+struct InflightEntry {
+  EngineConnection *origin;
+  int64_t send_time;
+  uint64_t index;
+};
+
+struct GlobalInflightRegistry {
+  std::mutex mu;
+  absl::flat_hash_map<uint64_t, InflightEntry> map;
+} g_inflight_registry;
+
+inline void RegisterInflight(uint64_t full_call_id, EngineConnection *origin,
+                             int64_t send_time, uint64_t index) {
+  std::lock_guard<std::mutex> lk(g_inflight_registry.mu);
+  g_inflight_registry.map[full_call_id] =
+      InflightEntry{origin, send_time, index};
+}
+
+inline bool ConsumeInflight(uint64_t full_call_id, EngineConnection **origin,
+                            int64_t *send_time, uint64_t *index) {
+  std::lock_guard<std::mutex> lk(g_inflight_registry.mu);
+  auto it = g_inflight_registry.map.find(full_call_id);
+  if (it == g_inflight_registry.map.end()) {
+    return false;
+  }
+  *origin = it->second.origin;
+  *send_time = it->second.send_time;
+  *index = it->second.index;
+  g_inflight_registry.map.erase(it);
+  return true;
+}
+} // anonymous namespace
 
 // Connection to Engine - handles both sending and receiving in event loop
 class EngineConnection {
@@ -99,6 +135,29 @@ public:
     state_ = kClosed;
   }
 
+  void OnInflightCompletedFromAnyThread(bool success, int64_t send_time,
+                                        uint64_t index, int64_t recv_time) {
+    inflight_count_.fetch_sub(1, std::memory_order_acq_rel);
+    {
+      std::lock_guard<std::mutex> lk(stats_mu_);
+      if (success) {
+        stats_.completed_count++;
+        if (warmup_done_.load(std::memory_order_acquire)) {
+          int64_t latency_us = recv_time - send_time;
+          stats_.latencies_us.push_back(latency_us);
+        }
+      } else {
+        stats_.failed_count++;
+      }
+    }
+  }
+
+  ConnectionStats SnapshotStats() const {
+    std::lock_guard<std::mutex> lk(
+        const_cast<EngineConnection *>(this)->stats_mu_);
+    return stats_;
+  }
+
 private:
   enum State { kCreated, kRunning, kClosed };
 
@@ -124,11 +183,17 @@ private:
   ConnectionStats stats_;
   absl::flat_hash_map<uint64_t, int64_t>
       inflight_requests_; // call_id -> send_timestamp
+  absl::flat_hash_map<uint64_t, uint64_t>
+      inflight_indices_; // call_id -> send_index
+
+  std::mutex stats_mu_;
+  std::atomic<size_t> inflight_count_{0};
 
   std::thread thread_;
   int owned_fd_ = -1;
   int64_t pacing_window_start_us_ = 0;
   uint32_t sent_in_window_ = 0;
+  uint64_t sent_message_index_ = 0;
 
   static void AllocBuffer(uv_handle_t *handle, size_t suggested_size,
                           uv_buf_t *buf) {
@@ -181,10 +246,11 @@ private:
 
         size_t capacity_left = 0;
         if (inflight_limit_ > 0) {
-          if (inflight_requests_.size() <
-              static_cast<size_t>(inflight_limit_)) {
-            capacity_left = static_cast<size_t>(inflight_limit_) -
-                            inflight_requests_.size();
+          size_t current_inflight =
+              inflight_count_.load(std::memory_order_acquire);
+          if (current_inflight < static_cast<size_t>(inflight_limit_)) {
+            capacity_left =
+                static_cast<size_t>(inflight_limit_) - current_inflight;
           } else {
             capacity_left = 0;
           }
@@ -238,10 +304,12 @@ private:
     GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
     message.payload_size = input_size_;
 
+    uint64_t current_index = ++sent_message_index_;
     SendMessage(message,
                 std::span<const char>(input_buffer_.data(), input_size_));
 
-    inflight_requests_[func_call.full_call_id] = send_time;
+    RegisterInflight(func_call.full_call_id, this, send_time, current_index);
+    inflight_count_.fetch_add(1, std::memory_order_acq_rel);
     stats_.sent_count++;
   }
 
@@ -296,7 +364,7 @@ private:
 
   void HandleResponse(const GatewayMessage &message,
                       std::span<const char> payload) {
-    if (state_ != kRunning || !test_enabled_.load(std::memory_order_acquire))
+    if (state_ != kRunning)
       return;
 
     int64_t recv_time = GetMonotonicMicroTimestamp();
@@ -305,23 +373,20 @@ private:
         IsFuncCallFailedMessage(message)) {
       FuncCall func_call = GetFuncCallFromMessage(message);
 
-      if (!inflight_requests_.contains(func_call.full_call_id)) {
+      EngineConnection *origin = nullptr;
+      int64_t send_time = 0;
+      uint64_t recv_index = 0;
+      if (!ConsumeInflight(func_call.full_call_id, &origin, &send_time,
+                           &recv_index)) {
         return; // Unknown response
       }
 
-      int64_t send_time = inflight_requests_[func_call.full_call_id];
-      inflight_requests_.erase(func_call.full_call_id);
-
       if (IsFuncCallCompleteMessage(message)) {
-        stats_.completed_count++;
-
-        // Only record latency after warmup
-        if (warmup_done_.load(std::memory_order_acquire)) {
-          int64_t latency_us = recv_time - send_time;
-          stats_.latencies_us.push_back(latency_us);
-        }
+        origin->OnInflightCompletedFromAnyThread(/*success=*/true, send_time,
+                                                 recv_index, recv_time);
       } else if (IsFuncCallFailedMessage(message)) {
-        stats_.failed_count++;
+        origin->OnInflightCompletedFromAnyThread(/*success=*/false, send_time,
+                                                 recv_index, recv_time);
       }
     }
   }
