@@ -1,491 +1,644 @@
 #include "base/init.h"
-#include "base/common.h"
-#include "base/thread.h"
-#include "common/time.h"
 #include "common/protocol.h"
+#include "common/time.h"
 #include "common/uv.h"
-#include "utils/socket.h"
-#include "utils/io.h"
+#include "server/server_base.h"
+#include "utils/appendable_buffer.h"
 
+#include <absl/flags/flag.h>
+#include <algorithm>
 #include <atomic>
+#include <signal.h>
 #include <thread>
 #include <vector>
-#include <chrono>
-#include <memory>
-#include <algorithm>
-#include <absl/flags/flag.h>
-#include <fmt/format.h>
 
-ABSL_FLAG(std::string, listen_addr, "0.0.0.0", "Address to listen for engine connections");
-ABSL_FLAG(int, listen_port, 10007, "Port to listen for engine connections");
-ABSL_FLAG(int, num_sender_threads, 20, "Number of request sender threads");
-ABSL_FLAG(int, duration_sec, 30, "Test duration in seconds");
-ABSL_FLAG(int, target_rps, 0, "Target RPS per sender thread (0 = unlimited)");
+ABSL_FLAG(std::string, listen_addr, "0.0.0.0",
+          "Address to listen for engine connections");
+ABSL_FLAG(int, listen_port, 10007, "Port for engine connections");
 ABSL_FLAG(int, func_id, 1, "Function ID to invoke");
+ABSL_FLAG(int, method_id, 0, "Method ID (for gRPC, 0 for HTTP)");
+ABSL_FLAG(int, duration_sec, 30, "Duration of stress test in seconds");
+ABSL_FLAG(int, target_rps, 0, "Target RPS per connection (0 = unlimited)");
+ABSL_FLAG(int, input_size, 64, "Size of input payload in bytes");
+ABSL_FLAG(int, inflight_limit, 1000, "Max inflight requests per connection");
+ABSL_FLAG(int, report_interval_sec, 1, "Interval for printing statistics");
+ABSL_FLAG(int, warmup_sec, 5, "Warmup period before starting measurement");
 
-using namespace faas;
-using protocol::GatewayMessage;
+namespace faas {
+namespace stress {
+
 using protocol::FuncCall;
-using protocol::NewFuncCall;
-using protocol::NewDispatchFuncCallGatewayMessage;
+using protocol::GatewayMessage;
+using protocol::GetFuncCallFromMessage;
 using protocol::IsEngineHandshakeMessage;
 using protocol::IsFuncCallCompleteMessage;
 using protocol::IsFuncCallFailedMessage;
-using protocol::GetFuncCallFromMessage;
+using protocol::NewDispatchFuncCallGatewayMessage;
+using protocol::NewFuncCall;
 
-struct Stats {
-    std::atomic<uint64_t> requests_sent{0};
-    std::atomic<uint64_t> responses_received{0};
-    std::atomic<uint64_t> errors{0};
-    std::atomic<uint64_t> total_latency_us{0};
-    std::atomic<uint64_t> min_latency_us{UINT64_MAX};
-    std::atomic<uint64_t> max_latency_us{0};
+// Per-connection statistics
+struct ConnectionStats {
+  uint64_t sent_count = 0;
+  uint64_t completed_count = 0;
+  uint64_t failed_count = 0;
+  std::vector<int64_t> latencies_us;
 
-    // For percentile calculations
-    absl::Mutex latencies_mu;
-    std::vector<uint64_t> latencies ABSL_GUARDED_BY(latencies_mu);
+  ConnectionStats() {
+    latencies_us.reserve(1000000); // Pre-allocate for 1M samples
+  }
 };
 
-class StressGateway : public uv::Base {
+class StressClient;
+
+// Connection to Engine - handles both sending and receiving in event loop
+class EngineConnection {
 public:
-    StressGateway()
-        : state_(kCreated),
-          next_call_id_(1),
-          engine_sock_fd_(-1),
-          stop_sending_(false),
-          stats_(nullptr) {
-        UV_DCHECK_OK(uv_loop_init(&uv_loop_));
-        UV_DCHECK_OK(uv_tcp_init(&uv_loop_, &uv_listen_handle_));
-        uv_listen_handle_.data = this;
+  EngineConnection(std::atomic<uint32_t> *call_id_alloc, uint16_t node_id,
+                   uint16_t conn_id, int func_id, int method_id, int input_size,
+                   int target_rps, int inflight_limit)
+      : call_id_alloc_(call_id_alloc), node_id_(node_id), conn_id_(conn_id),
+        func_id_(func_id), method_id_(method_id), input_size_(input_size),
+        target_rps_(target_rps), inflight_limit_(inflight_limit),
+        state_(kCreated), warmup_done_(false), test_enabled_(false) {
+
+    input_buffer_.resize(input_size_, 'x');
+  }
+
+  ~EngineConnection() { DCHECK(state_ == kCreated || state_ == kClosed); }
+
+  void Start(uv_loop_t *loop, uv_tcp_t *handle) {
+    DCHECK(state_ == kCreated);
+    loop_ = loop;
+    handle_ = handle;
+    handle_->data = this;
+
+    UV_DCHECK_OK(uv_tcp_nodelay(handle_, 1));
+    UV_DCHECK_OK(uv_tcp_keepalive(handle_, 1, 1));
+    UV_DCHECK_OK(uv_read_start(UV_AS_STREAM(handle_), AllocBuffer, OnRecvData));
+
+    // Initialize timer for sending (in event loop thread)
+    UV_DCHECK_OK(uv_timer_init(loop_, &send_timer_));
+    send_timer_.data = this;
+
+    // Start timer immediately - it will check test_enabled_ flag
+    UV_DCHECK_OK(uv_timer_start(&send_timer_, OnSendTimer, 0, 1));
+
+    last_send_time_ = GetMonotonicMicroTimestamp();
+    state_ = kRunning;
+  }
+
+  void EnableSending() { test_enabled_.store(true, std::memory_order_release); }
+
+  void DisableSending() {
+    test_enabled_.store(false, std::memory_order_release);
+  }
+
+  void SetWarmupDone() { warmup_done_.store(true, std::memory_order_release); }
+
+  uint16_t node_id() const { return node_id_; }
+  uint16_t conn_id() const { return conn_id_; }
+  const ConnectionStats &stats() const { return stats_; }
+
+  void Close() {
+    if (state_ == kClosed)
+      return;
+    // Stop generating new traffic
+    test_enabled_.store(false, std::memory_order_release);
+    // Stop and close timer if initialized
+    uv_timer_stop(&send_timer_);
+    uv_close(UV_AS_HANDLE(&send_timer_), nullptr);
+    // Stop reads and close socket
+    if (handle_ != nullptr) {
+      uv_read_stop(UV_AS_STREAM(handle_));
+      uv_close(UV_AS_HANDLE(handle_),
+               [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
     }
-
-    ~StressGateway() {
-        if (engine_sock_fd_ != -1) {
-            close(engine_sock_fd_);
-        }
-        UV_DCHECK_OK(uv_loop_close(&uv_loop_));
-    }
-
-    bool Start() {
-        std::string addr = absl::GetFlag(FLAGS_listen_addr);
-        int port = absl::GetFlag(FLAGS_listen_port);
-
-        struct sockaddr_in bind_addr;
-        UV_CHECK_OK(uv_ip4_addr(addr.c_str(), port, &bind_addr));
-        UV_CHECK_OK(uv_tcp_bind(&uv_listen_handle_, (const struct sockaddr*)&bind_addr, 0));
-
-        LOG(INFO) << "Listening on " << addr << ":" << port << " for engine connections";
-
-        UV_CHECK_OK(uv_listen(UV_AS_STREAM(&uv_listen_handle_), 128,
-                              &StressGateway::ConnectionCallback));
-
-        state_ = kRunning;
-
-        // Start event loop in separate thread using base::Thread
-        event_loop_thread_.reset(new base::Thread("EventLoop", [this]() {
-            LOG(INFO) << "Event loop thread started";
-            uv_run(&uv_loop_, UV_RUN_DEFAULT);
-            LOG(INFO) << "Event loop thread finished";
-        }));
-        event_loop_thread_->Start();
-
-        // Give event loop time to start
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        return true;
-    }
-
-    void WaitForEngine() {
-        LOG(INFO) << "Waiting for engine connection...";
-        while (engine_sock_fd_ == -1 && state_ == kRunning) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        }
-        if (engine_sock_fd_ != -1) {
-            LOG(INFO) << "Engine connected!";
-        }
-    }
-
-    void RunLoadTest(Stats* stats) {
-        stats_ = stats;  // Store global stats pointer
-        int num_threads = absl::GetFlag(FLAGS_num_sender_threads);
-
-        std::vector<std::unique_ptr<base::Thread>> sender_threads;
-
-        for (int i = 0; i < num_threads; i++) {
-            auto thread = std::make_unique<base::Thread>(
-                fmt::format("Sender{}", i),
-                [this, stats, i]() {
-                    this->SenderThread(stats, i);
-                });
-            thread->Start();
-            sender_threads.push_back(std::move(thread));
-        }
-
-        // Wait for all senders to finish
-        for (auto& t : sender_threads) {
-            t->Join();
-        }
-
-        stop_sending_ = true;
-    }
-
-    void Stop() {
-        stop_sending_ = true;
-
-        // Note: We don't join receiver threads or event loop thread - they will exit naturally.
-        // For a stress testing tool, clean shutdown isn't critical since the process will exit anyway.
-        // Joining would hang because:
-        // - Receiver threads are blocked on RecvData()
-        // - Event loop thread needs time to process handle close callbacks
-
-        // Stop the event loop (it will finish current iteration)
-        uv_stop(&uv_loop_);
-
-        state_ = kStopped;
-    }
+    state_ = kClosed;
+  }
 
 private:
-    enum State { kCreated, kRunning, kStopped };
+  enum State { kCreated, kRunning, kClosed };
 
-    State state_;
-    uv_loop_t uv_loop_;
-    uv_tcp_t uv_listen_handle_;
-    std::unique_ptr<base::Thread> event_loop_thread_;
+  std::atomic<uint32_t> *call_id_alloc_;
+  uint16_t node_id_;
+  uint16_t conn_id_;
+  int func_id_;
+  int method_id_;
+  int input_size_;
+  int target_rps_;
+  int inflight_limit_;
 
-    std::atomic<uint32_t> next_call_id_;
-    std::atomic<int> engine_sock_fd_;
-    std::atomic<bool> stop_sending_;
+  State state_;
+  uv_loop_t *loop_;
+  uv_tcp_t *handle_;
+  uv_timer_t send_timer_;
+  utils::AppendableBuffer read_buffer_;
 
-    absl::Mutex mu_;
-    absl::flat_hash_map<uint64_t, int64_t> pending_calls_ ABSL_GUARDED_BY(mu_);
-    Stats* stats_;  // Global stats pointer
-    absl::Mutex receiver_threads_mu_;
-    std::vector<std::unique_ptr<base::Thread>> receiver_threads_ ABSL_GUARDED_BY(receiver_threads_mu_);
+  std::atomic<bool> warmup_done_;
+  std::atomic<bool> test_enabled_;
+  int64_t last_send_time_;
+  std::string input_buffer_;
 
-    void SenderThread(Stats* stats, int thread_id) {
-        int duration_sec = absl::GetFlag(FLAGS_duration_sec);
-        int target_rps = absl::GetFlag(FLAGS_target_rps);
-        int func_id = absl::GetFlag(FLAGS_func_id);
+  ConnectionStats stats_;
+  absl::flat_hash_map<uint64_t, int64_t>
+      inflight_requests_; // call_id -> send_timestamp
 
-        auto start_time = std::chrono::steady_clock::now();
-        auto end_time = start_time + std::chrono::seconds(duration_sec);
+  static void AllocBuffer(uv_handle_t *handle, size_t suggested_size,
+                          uv_buf_t *buf) {
+    buf->base = new char[suggested_size];
+    buf->len = suggested_size;
+  }
 
-        uint64_t sent_count = 0;
-        int64_t sleep_ns = 0;
-        if (target_rps > 0) {
-            sleep_ns = 1000000000LL / target_rps;
+  static void OnRecvData(uv_stream_t *stream, ssize_t nread,
+                         const uv_buf_t *buf) {
+    auto *conn = reinterpret_cast<EngineConnection *>(stream->data);
+    std::unique_ptr<char[]> buffer_guard(buf->base);
+
+    if (nread < 0) {
+      // Close this connection on error/EOF so loop can exit cleanly
+      conn->Close();
+      return;
+    }
+    if (nread == 0)
+      return;
+
+    conn->read_buffer_.AppendData(buf->base, nread);
+    conn->ProcessMessages();
+  }
+
+  static void OnSendTimer(uv_timer_t *handle) {
+    auto *conn = reinterpret_cast<EngineConnection *>(handle->data);
+
+    // Check if sending is enabled
+    if (conn->state_ != kRunning ||
+        !conn->test_enabled_.load(std::memory_order_acquire))
+      return;
+
+    int64_t now = GetMonotonicMicroTimestamp();
+    int64_t inter_request_delay_us =
+        (conn->target_rps_ > 0) ? (1000000 / conn->target_rps_) : 0;
+
+    // Send multiple requests per timer tick if needed
+    while (conn->inflight_requests_.size() <
+           static_cast<size_t>(conn->inflight_limit_)) {
+      // Rate limiting check
+      if (conn->target_rps_ > 0) {
+        int64_t time_since_last = now - conn->last_send_time_;
+        if (time_since_last < inter_request_delay_us) {
+          break; // Too soon to send next request
         }
+      }
 
-        while (std::chrono::steady_clock::now() < end_time && !stop_sending_) {
-            int sock = engine_sock_fd_.load();
-            if (sock == -1) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
-            }
+      conn->SendRequest(now);
+      conn->last_send_time_ = now;
 
-            // Create function call
-            uint16_t client_id = 0;
-            uint32_t call_id = next_call_id_++;
-            FuncCall func_call = NewFuncCall(
-                gsl::narrow_cast<uint16_t>(func_id), client_id, call_id);
+      // For unlimited RPS, send burst up to inflight limit
+      if (conn->target_rps_ == 0) {
+        now = GetMonotonicMicroTimestamp();
+      } else {
+        break; // Rate limited - send one per timer tick
+      }
+    }
+  }
 
-            // Create dispatch message
-            GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
-            message.payload_size = 0;
+  void SendRequest(int64_t send_time) {
+    // Use client_id=0 for external requests (like Gateway does)
+    uint16_t client_id = 0;
+    uint32_t call_id = call_id_alloc_->fetch_add(1, std::memory_order_relaxed);
 
-            // Record send timestamp
-            int64_t send_time = GetMonotonicMicroTimestamp();
-
-            {
-                absl::MutexLock lock(&mu_);
-                pending_calls_[func_call.full_call_id] = send_time;
-            }
-
-            // Send to engine
-            if (!io_utils::SendData(sock, reinterpret_cast<const char*>(&message),
-                                    sizeof(GatewayMessage))) {
-                LOG(ERROR) << "Thread " << thread_id << " failed to send message";
-                stats->errors++;
-                break;
-            }
-
-            stats->requests_sent++;
-            sent_count++;
-
-            // Rate limiting
-            if (target_rps > 0 && sleep_ns > 0) {
-                std::this_thread::sleep_for(std::chrono::nanoseconds(sleep_ns));
-            }
-        }
-
-        LOG(INFO) << "Sender thread " << thread_id << " sent " << sent_count << " requests";
+    FuncCall func_call = NewFuncCall(func_id_, client_id, call_id);
+    if (method_id_ > 0) {
+      func_call.method_id = method_id_;
     }
 
-    void ReceiveLoop(int sock_fd, Stats* stats) {
-        LOG(INFO) << "Receiver thread started with fd=" << sock_fd;
+    GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
+    message.payload_size = input_size_;
 
-        while (!stop_sending_) {
-            GatewayMessage response;
-            bool eof = false;
+    SendMessage(message,
+                std::span<const char>(input_buffer_.data(), input_size_));
 
-            if (!io_utils::RecvData(sock_fd, reinterpret_cast<char*>(&response),
-                                    sizeof(GatewayMessage), &eof)) {
-                if (eof) {
-                    LOG(INFO) << "Engine connection closed (EOF)";
-                    break;
-                }
-                if (stop_sending_) {
-                    LOG(INFO) << "Receiver stopping due to stop signal";
-                    break;
-                }
-                LOG(ERROR) << "Failed to receive response from engine";
-                stats->errors++;
-                break;
-            }
+    inflight_requests_[func_call.full_call_id] = send_time;
+    stats_.sent_count++;
+  }
 
-            if (IsFuncCallCompleteMessage(response) || IsFuncCallFailedMessage(response)) {
-                int64_t recv_time = GetMonotonicMicroTimestamp();
+  void SendMessage(const GatewayMessage &message,
+                   std::span<const char> payload) {
+    if (state_ != kRunning)
+      return;
 
-                FuncCall func_call = GetFuncCallFromMessage(response);
-
-                int64_t send_time = 0;
-                {
-                    absl::MutexLock lock(&mu_);
-                    auto it = pending_calls_.find(func_call.full_call_id);
-                    if (it != pending_calls_.end()) {
-                        send_time = it->second;
-                        pending_calls_.erase(it);
-                    }
-                }
-
-                if (send_time > 0) {
-                    uint64_t latency_us = recv_time - send_time;
-                    stats->total_latency_us += latency_us;
-
-                    // Update min/max
-                    uint64_t current_min = stats->min_latency_us.load();
-                    while (latency_us < current_min &&
-                           !stats->min_latency_us.compare_exchange_weak(current_min, latency_us));
-
-                    uint64_t current_max = stats->max_latency_us.load();
-                    while (latency_us > current_max &&
-                           !stats->max_latency_us.compare_exchange_weak(current_max, latency_us));
-
-                    // Store latency for percentile calculation
-                    {
-                        absl::MutexLock lock(&stats->latencies_mu);
-                        stats->latencies.push_back(latency_us);
-                    }
-                }
-
-                stats->responses_received++;
-
-                if (IsFuncCallFailedMessage(response)) {
-                    stats->errors++;
-                }
-            }
-        }
-
-        LOG(INFO) << "Receiver thread stopped";
+    size_t total_size = sizeof(GatewayMessage) + payload.size();
+    char *buffer = new char[total_size];
+    memcpy(buffer, &message, sizeof(GatewayMessage));
+    if (!payload.empty()) {
+      memcpy(buffer + sizeof(GatewayMessage), payload.data(), payload.size());
     }
 
-    static void ConnectionCallback(uv_stream_t* server, int status) {
-        StressGateway* self = reinterpret_cast<StressGateway*>(server->data);
+    uv_buf_t buf = uv_buf_init(buffer, total_size);
+    uv_write_t *req = new uv_write_t();
+    req->data = buffer;
 
-        if (status < 0) {
-            LOG(ERROR) << "Connection error: " << uv_strerror(status);
-            return;
-        }
-
-        uv_tcp_t* client = reinterpret_cast<uv_tcp_t*>(malloc(sizeof(uv_tcp_t)));
-        uv_tcp_init(self->uv_loop(), client);
-
-        if (uv_accept(server, UV_AS_STREAM(client)) == 0) {
-            LOG(INFO) << "Engine connected!";
-
-            // Start reading handshake
-            client->data = self;
-            uv_read_start(UV_AS_STREAM(client), AllocCallback, ReadHandshakeCallback);
-        } else {
-            uv_close(UV_AS_HANDLE(client), CloseCallback);
-        }
+    int status = uv_write(req, UV_AS_STREAM(handle_), &buf, 1, OnSendComplete);
+    if (status != 0) {
+      delete[] buffer;
+      delete req;
     }
+  }
 
-    static void AllocCallback(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
-        buf->base = reinterpret_cast<char*>(malloc(suggested_size));
-        buf->len = suggested_size;
+  static void OnSendComplete(uv_write_t *req, int status) {
+    auto *buffer = reinterpret_cast<char *>(req->data);
+    delete[] buffer;
+    delete req;
+  }
+
+  void ProcessMessages() {
+    while (state_ == kRunning &&
+           read_buffer_.length() >= sizeof(GatewayMessage)) {
+      GatewayMessage *message =
+          reinterpret_cast<GatewayMessage *>(read_buffer_.data());
+      size_t full_size =
+          sizeof(GatewayMessage) + std::max<size_t>(0, message->payload_size);
+
+      if (read_buffer_.length() >= full_size) {
+        std::span<const char> payload(read_buffer_.data() +
+                                          sizeof(GatewayMessage),
+                                      full_size - sizeof(GatewayMessage));
+        HandleResponse(*message, payload);
+        read_buffer_.ConsumeFront(full_size);
+      } else {
+        break;
+      }
     }
+  }
 
-    static void ReadHandshakeCallback(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
-        StressGateway* self = reinterpret_cast<StressGateway*>(stream->data);
+  void HandleResponse(const GatewayMessage &message,
+                      std::span<const char> payload) {
+    if (state_ != kRunning || !test_enabled_.load(std::memory_order_acquire))
+      return;
 
-        if (nread < 0) {
-            if (nread != UV_EOF) {
-                LOG(ERROR) << "Read error: " << uv_strerror(nread);
-            }
-            free(buf->base);
-            uv_close(UV_AS_HANDLE(stream), CloseCallback);
-            return;
+    int64_t recv_time = GetMonotonicMicroTimestamp();
+
+    if (IsFuncCallCompleteMessage(message) ||
+        IsFuncCallFailedMessage(message)) {
+      FuncCall func_call = GetFuncCallFromMessage(message);
+
+      if (!inflight_requests_.contains(func_call.full_call_id)) {
+        return; // Unknown response
+      }
+
+      int64_t send_time = inflight_requests_[func_call.full_call_id];
+      inflight_requests_.erase(func_call.full_call_id);
+
+      if (IsFuncCallCompleteMessage(message)) {
+        stats_.completed_count++;
+
+        // Only record latency after warmup
+        if (warmup_done_.load(std::memory_order_acquire)) {
+          int64_t latency_us = recv_time - send_time;
+          stats_.latencies_us.push_back(latency_us);
         }
-
-        if (nread == 0) {
-            free(buf->base);
-            return;
-        }
-
-        // Check if it's a handshake message
-        if (nread >= static_cast<ssize_t>(sizeof(GatewayMessage))) {
-            const GatewayMessage* msg = reinterpret_cast<const GatewayMessage*>(buf->base);
-
-            if (IsEngineHandshakeMessage(*msg)) {
-                LOG(INFO) << "Received engine handshake: node_id=" << msg->node_id
-                          << ", conn_id=" << msg->conn_id;
-
-                // Get the underlying fd
-                int fd;
-                uv_fileno(UV_AS_HANDLE(stream), &fd);
-
-                // Duplicate the fd for our use (so we can use it even after uv closes)
-                int dup_fd = dup(fd);
-                if (dup_fd < 0) {
-                    PLOG(ERROR) << "Failed to dup fd";
-                    free(buf->base);
-                    uv_close(UV_AS_HANDLE(stream), CloseCallback);
-                    return;
-                }
-
-                self->engine_sock_fd_ = dup_fd;
-
-                // Stop reading on uv stream
-                uv_read_stop(stream);
-
-                // Close the uv handle (we're using dup_fd now)
-                // This prevents the handle leak
-                uv_close(UV_AS_HANDLE(stream), CloseCallback);
-
-                // Start receiver thread with duplicated fd using base::Thread
-                {
-                    absl::MutexLock lock(&self->receiver_threads_mu_);
-                    auto receiver = std::make_unique<base::Thread>(
-                        fmt::format("Receiver{}", self->receiver_threads_.size()),
-                        [self, dup_fd]() {
-                            // Wait for stats to be set
-                            while (self->stats_ == nullptr) {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                            }
-                            self->ReceiveLoop(dup_fd, self->stats_);
-                            // Close our duplicated fd when done
-                            close(dup_fd);
-                        });
-                    receiver->Start();
-                    self->receiver_threads_.push_back(std::move(receiver));
-                }
-
-                LOG(INFO) << "Engine handshake complete, receiver thread started";
-                free(buf->base);
-                return;  // Important: return early to avoid double-free
-            }
-        }
-
-        free(buf->base);
+      } else if (IsFuncCallFailedMessage(message)) {
+        stats_.failed_count++;
+      }
     }
-
-    static void CloseCallback(uv_handle_t* handle) {
-        free(handle);
-    }
-
-    uv_loop_t* uv_loop() { return &uv_loop_; }
+  }
 };
 
-void PrintStats(Stats* stats, int duration_sec) {
-    uint64_t total_sent = stats->requests_sent.load();
-    uint64_t total_received = stats->responses_received.load();
-    uint64_t total_errors = stats->errors.load();
-    uint64_t total_latency = stats->total_latency_us.load();
-    uint64_t min_latency = stats->min_latency_us.load();
-    uint64_t max_latency = stats->max_latency_us.load();
+// Main stress client
+class StressClient : public server::ServerBase {
+public:
+  StressClient()
+      : listen_backlog_(64), should_stop_(false), test_started_(false),
+        start_time_(0), end_time_(0), next_call_id_(1) {}
 
-    double avg_latency = 0;
-    if (total_received > 0) {
-        avg_latency = static_cast<double>(total_latency) / total_received;
+  ~StressClient() {}
+
+  void set_listen_addr(std::string_view addr) {
+    listen_addr_ = std::string(addr);
+  }
+  void set_listen_port(int port) { listen_port_ = port; }
+
+  uint32_t NextCallId() {
+    return next_call_id_.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void RunStressTest() {
+    int warmup_sec = absl::GetFlag(FLAGS_warmup_sec);
+    int duration_sec = absl::GetFlag(FLAGS_duration_sec);
+    int report_interval = absl::GetFlag(FLAGS_report_interval_sec);
+    int func_id = absl::GetFlag(FLAGS_func_id);
+    int method_id = absl::GetFlag(FLAGS_method_id);
+    int input_size = absl::GetFlag(FLAGS_input_size);
+    int target_rps = absl::GetFlag(FLAGS_target_rps);
+    int inflight_limit = absl::GetFlag(FLAGS_inflight_limit);
+
+    // Store test params for when connections arrive
+    func_id_ = func_id;
+    method_id_ = method_id;
+    input_size_ = input_size;
+    target_rps_ = target_rps;
+    inflight_limit_ = inflight_limit;
+
+    LOG(INFO) << "=== Nightcore Stress Test ===";
+    LOG(INFO) << "Function ID: " << func_id;
+    LOG(INFO) << "Method ID: " << method_id;
+    LOG(INFO) << "Input size: " << input_size << " bytes";
+    LOG(INFO) << "Target RPS per connection: "
+              << (target_rps == 0 ? "unlimited" : std::to_string(target_rps));
+    LOG(INFO) << "Inflight limit per connection: " << inflight_limit;
+    LOG(INFO) << "Warmup: " << warmup_sec << "s, Duration: " << duration_sec
+              << "s";
+    LOG(INFO) << "";
+    LOG(INFO) << "NOTE: Waiting for Engine to connect (concurrency controlled "
+                 "by Engine's --gateway_conn_per_worker)";
+    LOG(INFO) << "";
+
+    // Wait for at least one engine connection
+    LOG(INFO) << "Waiting for Engine to connect...";
+    while (connections_.empty() && !should_stop_.load()) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    double throughput = static_cast<double>(total_received) / duration_sec;
-
-    // Calculate 99th percentile
-    uint64_t p99_latency = 0;
-    {
-        absl::MutexLock lock(&stats->latencies_mu);
-        if (!stats->latencies.empty()) {
-            std::vector<uint64_t> sorted_latencies = stats->latencies;
-            std::sort(sorted_latencies.begin(), sorted_latencies.end());
-            size_t p99_index = (sorted_latencies.size() * 99) / 100;
-            if (p99_index >= sorted_latencies.size()) {
-                p99_index = sorted_latencies.size() - 1;
-            }
-            p99_latency = sorted_latencies[p99_index];
-        }
+    if (should_stop_.load()) {
+      LOG(INFO) << "Interrupted before engine connected";
+      return;
     }
 
-    LOG(INFO) << "=== Benchmark Results ===";
-    LOG(INFO) << "Duration: " << duration_sec << " seconds";
-    LOG(INFO) << "Total requests sent: " << total_sent;
-    LOG(INFO) << "Total responses received: " << total_received;
-    LOG(INFO) << "Total errors: " << total_errors;
-    LOG(INFO) << "Throughput: " << throughput << " req/s";
-    LOG(INFO) << "Average latency: " << avg_latency << " μs";
-    if (min_latency != UINT64_MAX) {
-        LOG(INFO) << "Min latency: " << min_latency << " μs";
+    LOG(INFO) << "Engine connected with " << connections_.size()
+              << " connection(s)";
+    LOG(INFO) << "Total potential RPS: "
+              << (target_rps == 0
+                      ? "unlimited"
+                      : std::to_string(target_rps * connections_.size()));
+    LOG(INFO) << "";
+
+    // Wait for workers to initialize before starting to send requests
+    LOG(INFO) << "Waiting 3 seconds for workers to initialize...";
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+
+    // Enable sending on all connections
+    for (auto &conn : connections_) {
+      conn->EnableSending();
     }
-    LOG(INFO) << "P99 latency: " << p99_latency << " μs";
-    LOG(INFO) << "Max latency: " << max_latency << " μs";
-    if (total_sent > 0) {
-        LOG(INFO) << "Success rate: "
-                  << (100.0 * (total_received - total_errors) / total_sent) << "%";
+
+    test_started_ = true;
+
+    // Warmup phase
+    if (warmup_sec > 0) {
+      LOG(INFO) << "Warmup phase: " << warmup_sec << " seconds...";
+      std::this_thread::sleep_for(std::chrono::seconds(warmup_sec));
+
+      for (auto &conn : connections_) {
+        conn->SetWarmupDone();
+      }
+
+      LOG(INFO) << "Warmup complete. Starting measurement...";
+      LOG(INFO) << "";
+    } else {
+      for (auto &conn : connections_) {
+        conn->SetWarmupDone();
+      }
     }
+
+    start_time_ = GetMonotonicMicroTimestamp();
+
+    // Test phase with periodic reporting
+    for (int elapsed = 0; elapsed < duration_sec && !should_stop_.load();
+         elapsed += report_interval) {
+      std::this_thread::sleep_for(std::chrono::seconds(
+          std::min(report_interval, duration_sec - elapsed)));
+
+      if (!should_stop_.load()) {
+        PrintProgress(elapsed + report_interval);
+      }
+    }
+
+    end_time_ = GetMonotonicMicroTimestamp();
+
+    // Disable sending on all connections
+    for (auto &conn : connections_) {
+      conn->DisableSending();
+    }
+
+    // Print final results
+    LOG(INFO) << "";
+    PrintFinalResults();
+  }
+
+private:
+  std::string listen_addr_;
+  int listen_port_;
+  int listen_backlog_;
+  uv_tcp_t listen_handle_;
+
+  // Test parameters (set when test starts)
+  int func_id_;
+  int method_id_;
+  int input_size_;
+  int target_rps_;
+  int inflight_limit_;
+
+  std::vector<std::unique_ptr<EngineConnection>> connections_;
+  std::atomic<bool> should_stop_;
+  bool test_started_;
+  int64_t start_time_;
+  int64_t end_time_;
+  std::atomic<uint32_t> next_call_id_;
+
+  void StartInternal() override {
+    struct sockaddr_in bind_addr;
+    UV_CHECK_OK(uv_tcp_init(uv_loop(), &listen_handle_));
+    listen_handle_.data = this;
+
+    UV_CHECK_OK(uv_ip4_addr(listen_addr_.c_str(), listen_port_, &bind_addr));
+    UV_CHECK_OK(
+        uv_tcp_bind(&listen_handle_, (const struct sockaddr *)&bind_addr, 0));
+
+    UV_CHECK_OK(uv_listen(UV_AS_STREAM(&listen_handle_), listen_backlog_,
+                          OnNewConnection));
+  }
+
+  void StopInternal() override {
+    should_stop_.store(true);
+    // Close listener and all active connections so the loop can terminate
+    uv_close(UV_AS_HANDLE(&listen_handle_), nullptr);
+    for (auto &conn : connections_) {
+      conn->DisableSending();
+      conn->Close();
+    }
+  }
+
+  static void OnNewConnection(uv_stream_t *server, int status) {
+    auto *self = reinterpret_cast<StressClient *>(server->data);
+
+    if (status != 0) {
+      return;
+    }
+
+    uv_tcp_t *client = new uv_tcp_t();
+    UV_DCHECK_OK(uv_tcp_init(server->loop, client));
+
+    if (uv_accept(server, UV_AS_STREAM(client)) == 0) {
+      client->data = self;
+      UV_DCHECK_OK(
+          uv_read_start(UV_AS_STREAM(client), AllocBuffer, OnHandshake));
+    } else {
+      uv_close(UV_AS_HANDLE(client),
+               [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
+    }
+  }
+
+  static void AllocBuffer(uv_handle_t *handle, size_t suggested_size,
+                          uv_buf_t *buf) {
+    buf->base = new char[suggested_size];
+    buf->len = suggested_size;
+  }
+
+  static void OnHandshake(uv_stream_t *stream, ssize_t nread,
+                          const uv_buf_t *buf) {
+    auto *self = reinterpret_cast<StressClient *>(stream->data);
+    std::unique_ptr<char[]> buffer_guard(buf->base);
+
+    if (nread < 0) {
+      uv_close(UV_AS_HANDLE(stream),
+               [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
+      return;
+    }
+
+    if (nread < static_cast<ssize_t>(sizeof(GatewayMessage))) {
+      return; // Wait for more data
+    }
+
+    const GatewayMessage *message =
+        reinterpret_cast<const GatewayMessage *>(buf->base);
+    if (!IsEngineHandshakeMessage(*message)) {
+      uv_close(UV_AS_HANDLE(stream),
+               [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
+      return;
+    }
+
+    UV_DCHECK_OK(uv_read_stop(stream));
+
+    uint16_t node_id = message->node_id;
+    uint16_t conn_id = message->conn_id;
+
+    // Create connection with test parameters
+    auto connection = std::make_unique<EngineConnection>(
+        &self->next_call_id_, node_id, conn_id, self->func_id_,
+        self->method_id_, self->input_size_, self->target_rps_,
+        self->inflight_limit_);
+
+    connection->Start(stream->loop, reinterpret_cast<uv_tcp_t *>(stream));
+
+    self->connections_.push_back(std::move(connection));
+  }
+
+  void PrintProgress(int elapsed_sec) {
+    ConnectionStats merged = MergeStats();
+
+    LOG(INFO) << fmt::format(
+        "[T+{}s] Sent: {} | Completed: {} | Failed: {} | Latencies: {}",
+        elapsed_sec, merged.sent_count, merged.completed_count,
+        merged.failed_count, merged.latencies_us.size());
+  }
+
+  void PrintFinalResults() {
+    ConnectionStats merged = MergeStats();
+
+    double duration_sec = (end_time_ - start_time_) / 1e6;
+    double throughput = merged.completed_count / duration_sec;
+
+    LOG(INFO) << "========================================";
+    LOG(INFO) << "=== Stress Test Results ===";
+    LOG(INFO) << "========================================";
+    LOG(INFO) << fmt::format("Connections:       {}", connections_.size());
+    LOG(INFO) << fmt::format("Duration:          {:.2f} seconds", duration_sec);
+    LOG(INFO) << fmt::format("Total Sent:        {}", merged.sent_count);
+    LOG(INFO) << fmt::format("Total Completed:   {} ({:.2f}%)",
+                             merged.completed_count,
+                             100.0 * merged.completed_count /
+                                 std::max<uint64_t>(1, merged.sent_count));
+    LOG(INFO) << fmt::format(
+        "Total Failed:      {} ({:.2f}%)", merged.failed_count,
+        100.0 * merged.failed_count / std::max<uint64_t>(1, merged.sent_count));
+    LOG(INFO) << "";
+    LOG(INFO) << fmt::format("Throughput:        {:.1f} rps", throughput);
+    LOG(INFO) << "";
+
+    if (!merged.latencies_us.empty()) {
+      std::sort(merged.latencies_us.begin(), merged.latencies_us.end());
+
+      size_t n = merged.latencies_us.size();
+      int64_t min_lat = merged.latencies_us[0];
+      int64_t p50_lat = merged.latencies_us[n * 50 / 100];
+      int64_t p90_lat = merged.latencies_us[n * 90 / 100];
+      int64_t p99_lat = merged.latencies_us[n * 99 / 100];
+      int64_t p999_lat = merged.latencies_us[n * 999 / 1000];
+      int64_t max_lat = merged.latencies_us[n - 1];
+
+      LOG(INFO) << "Latency (us):";
+      LOG(INFO) << fmt::format("  Min:    {}", min_lat);
+      LOG(INFO) << fmt::format("  p50:    {}", p50_lat);
+      LOG(INFO) << fmt::format("  p90:    {}", p90_lat);
+      LOG(INFO) << fmt::format("  p99:    {}", p99_lat);
+      LOG(INFO) << fmt::format("  p99.9:  {}", p999_lat);
+      LOG(INFO) << fmt::format("  Max:    {}", max_lat);
+    } else {
+      LOG(INFO) << "No latency data collected";
+    }
+
+    LOG(INFO) << "========================================";
+  }
+
+  ConnectionStats MergeStats() {
+    ConnectionStats merged;
+    for (const auto &conn : connections_) {
+      const ConnectionStats &stats = conn->stats();
+      merged.sent_count += stats.sent_count;
+      merged.completed_count += stats.completed_count;
+      merged.failed_count += stats.failed_count;
+      merged.latencies_us.insert(merged.latencies_us.end(),
+                                 stats.latencies_us.begin(),
+                                 stats.latencies_us.end());
+    }
+    return merged;
+  }
+};
+
+} // namespace stress
+} // namespace faas
+
+static std::atomic<faas::stress::StressClient *> g_stress_client(nullptr);
+
+void SignalHandler(int signal) {
+  faas::stress::StressClient *client = g_stress_client.exchange(nullptr);
+  if (client != nullptr) {
+    LOG(INFO) << "Received signal, stopping...";
+    client->ScheduleStop();
+  }
 }
 
-int main(int argc, char* argv[]) {
-    faas::base::InitMain(argc, argv);
+int main(int argc, char *argv[]) {
+  signal(SIGINT, SignalHandler);
+  faas::base::InitMain(argc, argv);
 
-    int duration_sec = absl::GetFlag(FLAGS_duration_sec);
+  auto client = std::make_unique<faas::stress::StressClient>();
+  client->set_listen_addr(absl::GetFlag(FLAGS_listen_addr));
+  client->set_listen_port(absl::GetFlag(FLAGS_listen_port));
 
-    LOG(INFO) << "Starting Nightcore stress test (Gateway mode)";
-    LOG(INFO) << "Test duration: " << duration_sec << " seconds";
-    LOG(INFO) << "Sender threads: " << absl::GetFlag(FLAGS_num_sender_threads);
-    LOG(INFO) << "Target RPS per thread: "
-              << (absl::GetFlag(FLAGS_target_rps) == 0 ? "unlimited" :
-                  std::to_string(absl::GetFlag(FLAGS_target_rps)));
+  g_stress_client.store(client.get());
 
-    Stats stats;
-    StressGateway gateway;
+  LOG(INFO) << "Listening on " << absl::GetFlag(FLAGS_listen_addr) << ":"
+            << absl::GetFlag(FLAGS_listen_port) << " for Engine connections";
 
-    if (!gateway.Start()) {
-        LOG(FATAL) << "Failed to start gateway";
-    }
+  client->Start();
 
-    // Wait for engine to connect
-    gateway.WaitForEngine();
+  // Run stress test directly in main thread
+  std::this_thread::sleep_for(
+      std::chrono::milliseconds(500)); // Let server start
+  client->RunStressTest();
+  client->ScheduleStop();
 
-    // Give engine time to stabilize
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+  client->WaitForFinish();
 
-    LOG(INFO) << "Starting load test...";
-    auto start_time = std::chrono::steady_clock::now();
-
-    // Run load test
-    gateway.RunLoadTest(&stats);
-
-    auto end_time = std::chrono::steady_clock::now();
-    int actual_duration = std::chrono::duration_cast<std::chrono::seconds>(
-        end_time - start_time).count();
-
-    // Give time for remaining responses
-    std::this_thread::sleep_for(std::chrono::seconds(2));
-
-    gateway.Stop();
-
-    PrintStats(&stats, actual_duration);
-
-    return 0;
+  return 0;
 }
