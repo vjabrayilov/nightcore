@@ -8,8 +8,10 @@
 #include <absl/flags/flag.h>
 #include <algorithm>
 #include <atomic>
+#include <fcntl.h>
 #include <signal.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
 
 ABSL_FLAG(std::string, listen_addr, "0.0.0.0",
@@ -59,32 +61,19 @@ public:
       : call_id_alloc_(call_id_alloc), node_id_(node_id), conn_id_(conn_id),
         func_id_(func_id), method_id_(method_id), input_size_(input_size),
         target_rps_(target_rps), inflight_limit_(inflight_limit),
-        state_(kCreated), warmup_done_(false), test_enabled_(false) {
+        state_(kCreated), loop_(nullptr), warmup_done_(false),
+        test_enabled_(false), should_stop_(false) {
 
     input_buffer_.resize(input_size_, 'x');
   }
 
   ~EngineConnection() { DCHECK(state_ == kCreated || state_ == kClosed); }
 
-  void Start(uv_loop_t *loop, uv_tcp_t *handle) {
+  void StartFromFd(int fd) {
+    LOG(INFO) << "Starting EngineConnection thread";
     DCHECK(state_ == kCreated);
-    loop_ = loop;
-    handle_ = handle;
-    handle_->data = this;
-
-    UV_DCHECK_OK(uv_tcp_nodelay(handle_, 1));
-    UV_DCHECK_OK(uv_tcp_keepalive(handle_, 1, 1));
-    UV_DCHECK_OK(uv_read_start(UV_AS_STREAM(handle_), AllocBuffer, OnRecvData));
-
-    // Initialize timer for sending (in event loop thread)
-    UV_DCHECK_OK(uv_timer_init(loop_, &send_timer_));
-    send_timer_.data = this;
-
-    // Start timer immediately - it will check test_enabled_ flag
-    UV_DCHECK_OK(uv_timer_start(&send_timer_, OnSendTimer, 0, 1));
-
-    last_send_time_ = GetMonotonicMicroTimestamp();
-    state_ = kRunning;
+    owned_fd_ = fd;
+    thread_ = std::thread(&EngineConnection::ThreadMain, this);
   }
 
   void EnableSending() { test_enabled_.store(true, std::memory_order_release); }
@@ -102,16 +91,10 @@ public:
   void Close() {
     if (state_ == kClosed)
       return;
-    // Stop generating new traffic
     test_enabled_.store(false, std::memory_order_release);
-    // Stop and close timer if initialized
-    uv_timer_stop(&send_timer_);
-    uv_close(UV_AS_HANDLE(&send_timer_), nullptr);
-    // Stop reads and close socket
-    if (handle_ != nullptr) {
-      uv_read_stop(UV_AS_STREAM(handle_));
-      uv_close(UV_AS_HANDLE(handle_),
-               [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
+    should_stop_.store(true, std::memory_order_release);
+    if (thread_.joinable() && std::this_thread::get_id() != thread_.get_id()) {
+      thread_.join();
     }
     state_ = kClosed;
   }
@@ -130,18 +113,22 @@ private:
 
   State state_;
   uv_loop_t *loop_;
-  uv_tcp_t *handle_;
-  uv_timer_t send_timer_;
+  uv_tcp_t handle_;
   utils::AppendableBuffer read_buffer_;
 
   std::atomic<bool> warmup_done_;
   std::atomic<bool> test_enabled_;
-  int64_t last_send_time_;
+  std::atomic<bool> should_stop_;
   std::string input_buffer_;
 
   ConnectionStats stats_;
   absl::flat_hash_map<uint64_t, int64_t>
       inflight_requests_; // call_id -> send_timestamp
+
+  std::thread thread_;
+  int owned_fd_ = -1;
+  int64_t pacing_window_start_us_ = 0;
+  uint32_t sent_in_window_ = 0;
 
   static void AllocBuffer(uv_handle_t *handle, size_t suggested_size,
                           uv_buf_t *buf) {
@@ -166,39 +153,76 @@ private:
     conn->ProcessMessages();
   }
 
-  static void OnSendTimer(uv_timer_t *handle) {
-    auto *conn = reinterpret_cast<EngineConnection *>(handle->data);
+  void ThreadMain() {
+    uv_loop_t owned_loop;
+    UV_CHECK_OK(uv_loop_init(&owned_loop));
+    loop_ = &owned_loop;
 
-    // Check if sending is enabled
-    if (conn->state_ != kRunning ||
-        !conn->test_enabled_.load(std::memory_order_acquire))
-      return;
+    UV_CHECK_OK(uv_tcp_init(loop_, &handle_));
+    handle_.data = this;
+    UV_CHECK_OK(uv_tcp_open(&handle_, owned_fd_));
+    UV_DCHECK_OK(uv_tcp_nodelay(&handle_, 1));
+    UV_DCHECK_OK(uv_tcp_keepalive(&handle_, 1, 1));
+    UV_DCHECK_OK(
+        uv_read_start(UV_AS_STREAM(&handle_), AllocBuffer, OnRecvData));
 
-    int64_t now = GetMonotonicMicroTimestamp();
-    int64_t inter_request_delay_us =
-        (conn->target_rps_ > 0) ? (1000000 / conn->target_rps_) : 0;
+    state_ = kRunning;
+    pacing_window_start_us_ = GetMonotonicMicroTimestamp();
+    sent_in_window_ = 0;
 
-    // Send multiple requests per timer tick if needed
-    while (conn->inflight_requests_.size() <
-           static_cast<size_t>(conn->inflight_limit_)) {
-      // Rate limiting check
-      if (conn->target_rps_ > 0) {
-        int64_t time_since_last = now - conn->last_send_time_;
-        if (time_since_last < inter_request_delay_us) {
-          break; // Too soon to send next request
+    while (!should_stop_.load(std::memory_order_acquire)) {
+      if (test_enabled_.load(std::memory_order_acquire) && state_ == kRunning) {
+        // Refresh pacing window (1s)
+        int64_t now = GetMonotonicMicroTimestamp();
+        if (now - pacing_window_start_us_ >= 1000000) {
+          pacing_window_start_us_ = now;
+          sent_in_window_ = 0;
+        }
+
+        size_t capacity_left = 0;
+        if (inflight_limit_ > 0) {
+          if (inflight_requests_.size() <
+              static_cast<size_t>(inflight_limit_)) {
+            capacity_left = static_cast<size_t>(inflight_limit_) -
+                            inflight_requests_.size();
+          } else {
+            capacity_left = 0;
+          }
+        } else {
+          capacity_left = std::numeric_limits<size_t>::max();
+        }
+
+        size_t quota_left = std::numeric_limits<size_t>::max();
+        if (target_rps_ > 0) {
+          if (sent_in_window_ >= static_cast<uint32_t>(target_rps_)) {
+            quota_left = 0;
+          } else {
+            quota_left = static_cast<size_t>(target_rps_ - sent_in_window_);
+          }
+        }
+
+        size_t to_send = std::min(capacity_left, quota_left);
+        for (size_t i = 0; i < to_send && state_ == kRunning; i++) {
+          int64_t send_ts = GetMonotonicMicroTimestamp();
+          SendRequest(send_ts);
+          if (target_rps_ > 0) {
+            sent_in_window_++;
+          }
         }
       }
 
-      conn->SendRequest(now);
-      conn->last_send_time_ = now;
-
-      // For unlimited RPS, send burst up to inflight limit
-      if (conn->target_rps_ == 0) {
-        now = GetMonotonicMicroTimestamp();
-      } else {
-        break; // Rate limited - send one per timer tick
-      }
+      // Pump the loop to receive completions and write callbacks
+      uv_run(loop_, UV_RUN_NOWAIT);
+      // Busy spin by design (no sleeps)
     }
+
+    // Begin shutdown on connection thread
+    uv_read_stop(UV_AS_STREAM(&handle_));
+    uv_close(UV_AS_HANDLE(&handle_), nullptr);
+    while (uv_run(loop_, UV_RUN_NOWAIT) != 0) {
+    }
+    UV_CHECK_OK(uv_loop_close(loop_));
+    state_ = kClosed;
   }
 
   void SendRequest(int64_t send_time) {
@@ -237,7 +261,7 @@ private:
     uv_write_t *req = new uv_write_t();
     req->data = buffer;
 
-    int status = uv_write(req, UV_AS_STREAM(handle_), &buf, 1, OnSendComplete);
+    int status = uv_write(req, UV_AS_STREAM(&handle_), &buf, 1, OnSendComplete);
     if (status != 0) {
       delete[] buffer;
       delete req;
@@ -348,9 +372,7 @@ public:
     LOG(INFO) << "Warmup: " << warmup_sec << "s, Duration: " << duration_sec
               << "s";
     LOG(INFO) << "";
-    LOG(INFO) << "NOTE: Waiting for Engine to connect (concurrency controlled "
-                 "by Engine's --gateway_conn_per_worker)";
-    LOG(INFO) << "";
+    LOG(INFO) << "========================================";
 
     // Wait for at least one engine connection
     LOG(INFO) << "Waiting for Engine to connect...";
@@ -521,13 +543,33 @@ private:
     uint16_t node_id = message->node_id;
     uint16_t conn_id = message->conn_id;
 
-    // Create connection with test parameters
+    // Extract OS fd from the accepted handle and duplicate it for a new loop
+    uv_os_fd_t os_fd;
+    UV_DCHECK_OK(
+        uv_fileno(reinterpret_cast<const uv_handle_t *>(stream), &os_fd));
+    int dup_fd = dup(static_cast<int>(os_fd));
+    if (dup_fd < 0) {
+      uv_close(UV_AS_HANDLE(stream),
+               [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
+      return;
+    }
+    // Ensure non-blocking
+    int flags = fcntl(dup_fd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(dup_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    // Close and delete the temporary handle on the acceptor loop
+    uv_close(UV_AS_HANDLE(stream),
+             [](uv_handle_t *h) { delete reinterpret_cast<uv_tcp_t *>(h); });
+
+    // Create connection with test parameters and start its own loop/thread
     auto connection = std::make_unique<EngineConnection>(
         &self->next_call_id_, node_id, conn_id, self->func_id_,
         self->method_id_, self->input_size_, self->target_rps_,
         self->inflight_limit_);
 
-    connection->Start(stream->loop, reinterpret_cast<uv_tcp_t *>(stream));
+    connection->StartFromFd(dup_fd);
 
     self->connections_.push_back(std::move(connection));
   }
