@@ -21,7 +21,8 @@ ABSL_FLAG(int, listen_port, 10007, "Port for engine connections");
 ABSL_FLAG(int, func_id, 1, "Function ID to invoke");
 ABSL_FLAG(int, method_id, 0, "Method ID (for gRPC, 0 for HTTP)");
 ABSL_FLAG(int, duration_sec, 30, "Duration of stress test in seconds");
-ABSL_FLAG(int, target_rps, 0, "Target RPS per connection (0 = unlimited)");
+ABSL_FLAG(int, target_rps, 0,
+          "Global target RPS across all connections (0 = unlimited)");
 ABSL_FLAG(int, input_size, 64, "Size of input payload in bytes");
 ABSL_FLAG(int, inflight_limit, 1000, "Max inflight requests per connection");
 ABSL_FLAG(int, report_interval_sec, 1, "Interval for printing statistics");
@@ -117,6 +118,8 @@ public:
   void DisableSending() {
     test_enabled_.store(false, std::memory_order_release);
   }
+
+  void SetTargetRps(int target_rps) { target_rps_ = target_rps; }
 
   void SetWarmupDone() { warmup_done_.store(true, std::memory_order_release); }
 
@@ -431,7 +434,7 @@ public:
     LOG(INFO) << "Function ID: " << func_id;
     LOG(INFO) << "Method ID: " << method_id;
     LOG(INFO) << "Input size: " << input_size << " bytes";
-    LOG(INFO) << "Target RPS per connection: "
+    LOG(INFO) << "Global target RPS: "
               << (target_rps == 0 ? "unlimited" : std::to_string(target_rps));
     LOG(INFO) << "Inflight limit per connection: " << inflight_limit;
     LOG(INFO) << "Warmup: " << warmup_sec << "s, Duration: " << duration_sec
@@ -452,17 +455,33 @@ public:
 
     LOG(INFO) << "Engine connected with " << connections_.size()
               << " connection(s)";
-    LOG(INFO) << "Total potential RPS: "
-              << (target_rps == 0
-                      ? "unlimited"
-                      : std::to_string(target_rps * connections_.size()));
+    LOG(INFO) << "Global target RPS: "
+              << (target_rps == 0 ? "unlimited" : std::to_string(target_rps));
     LOG(INFO) << "";
 
     // Wait for workers to initialize before starting to send requests
     LOG(INFO) << "Waiting 3 seconds for workers to initialize...";
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    // Enable sending on all connections
+    // Distribute global target RPS across connections and enable sending
+    if (!connections_.empty()) {
+      if (target_rps_ <= 0) {
+        for (auto &conn : connections_) {
+          conn->SetTargetRps(0); // unlimited per connection
+        }
+      } else {
+        int base = target_rps_ / static_cast<int>(connections_.size());
+        int rem = target_rps_ % static_cast<int>(connections_.size());
+        for (size_t i = 0; i < connections_.size(); i++) {
+          int per_conn = base + (static_cast<int>(i) < rem ? 1 : 0);
+          connections_[i]->SetTargetRps(per_conn);
+        }
+        LOG(INFO) << fmt::format(
+            "Per-connection target RPS: base={} (+1 for first {} conns)", base,
+            rem);
+      }
+    }
+
     for (auto &conn : connections_) {
       conn->EnableSending();
     }
