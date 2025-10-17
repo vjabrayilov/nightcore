@@ -1,0 +1,18 @@
+[package]
+name = "hyperlight-example-guest"
+version = "0.1.0"
+edition = "2024"
+authors = ["Vahab Jabrayilov <vjabayilov@cs.columbia.edu>"]
+license = "Apache-2.0"
+repository = "https://github.com/hyperlight-dev/hyperlight"
+description = "Hyperlight example guest binary"
+categories = ["no-std", "embedded", "virtualization"]
+keywords = ["hyperlight", "guest", "sandbox"]
+
+[dependencies]
+hyperlight-common = {workspace = true}
+hyperlight-guest-bin = {workspace = true}
+hyperlight-guest = {workspace = true}
+
+[package.metadata]
+documentation = "https://docs.rs/hyperlight"

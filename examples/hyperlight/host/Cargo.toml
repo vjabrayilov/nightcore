@@ -1,0 +1,14 @@
+[package]
+name = "hyperlight-example-host"
+version = "0.1.0"
+edition = "2024"
+authors = ["Vahab Jabrayilov <vjabayilov@cs.columbia.edu>"]
+license = "Apache-2.0"
+repository = "https://github.com/hyperlight-dev/hyperlight"
+description = "Hyperlight example host harness"
+categories = ["virtualization", "os"]
+keywords = ["hyperlight", "sandbox", "host"]
+
+[dependencies]
+hyperlight-host = { workspace = true }
+hyperlight-common = { workspace = true }

@@ -1,0 +1,15 @@
+[workspace]
+members = [
+"host/",
+"guest/",
+]
+default-members = [
+"host/",
+]
+resolver = "2"
+
+[workspace.dependencies]
+hyperlight-guest = { git = "https://github.com/hyperlight-dev/hyperlight/", tag = "v0.6.0", package = "hyperlight-guest" }
+hyperlight-guest-bin = {git = "https://github.com/hyperlight-dev/hyperlight/", tag = "v0.6.0", package = "hyperlight-guest-bin" }
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight/", tag = "v0.6.0", default-features = false, package = "hyperlight-common" }
+hyperlight-host = { git = "https://github.com/hyperlight-dev/hyperlight/", tag = "v0.6.0", default-features = false, features = ["kvm"], package = "hyperlight-host" }
