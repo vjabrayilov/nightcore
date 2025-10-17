@@ -1,0 +1,14 @@
+[package]
+name = "hyperlight-worker"
+version = "0.1.0"
+edition = "2021"
+authors = ["Vahab Jabrayilov <vjabayilov@cs.columbia.edu>"]
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hyperlight-host = { workspace = true }
+hyperlight-common = { workspace = true }
+libc = "0.2"
