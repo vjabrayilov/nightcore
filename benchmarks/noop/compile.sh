@@ -8,4 +8,4 @@ gcc -shared -fPIC -O2 \
     $BASE_DIR/noop.c \
     -o $BASE_DIR/libnoop.so
 
-echo "Compiled libnoop.so"
+echo "Compiled libnoop.so at $BASE_DIR/libnoop.so"
