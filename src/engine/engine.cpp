@@ -32,7 +32,9 @@ using protocol::IsFuncWorkerHandshakeMessage;
 using protocol::IsInvokeFuncMessage;
 using protocol::IsFuncCallCompleteMessage;
 using protocol::IsFuncCallFailedMessage;
+using protocol::IsDispatchFuncCallMessage;
 using protocol::NewHandshakeResponseMessage;
+using protocol::NewEngineHandshakeGatewayMessage;
 using protocol::NewFuncCallCompleteGatewayMessage;
 using protocol::NewFuncCallFailedGatewayMessage;
 using protocol::ComputeMessageDelay;
@@ -45,6 +47,8 @@ Engine::Engine()
       engine_tcp_port_(-1),
       func_worker_use_engine_socket_(absl::GetFlag(FLAGS_func_worker_use_engine_socket)),
       use_fifo_for_nested_call_(absl::GetFlag(FLAGS_use_fifo_for_nested_call)),
+      use_machnet_(false),
+      next_machnet_conn_idx_(0),
       uv_handle_(nullptr),
       next_gateway_conn_worker_id_(0),
       next_ipc_conn_worker_id_(0),
@@ -92,18 +96,57 @@ void Engine::StartInternal() {
     CHECK_GT(gateway_conn_per_worker_, 0);
     CHECK(!gateway_addr_.empty());
     CHECK_NE(gateway_port_, -1);
-    struct sockaddr_in addr;
-    if (!utils::FillTcpSocketAddr(&addr, gateway_addr_, gateway_port_)) {
-        HLOG(FATAL) << "Failed to fill socker address for " << gateway_addr_;
-    }
-    int total_gateway_conn = num_io_workers_ * gateway_conn_per_worker_;
-    for (int i = 0; i < total_gateway_conn; i++) {
-        uv_tcp_t* uv_handle = reinterpret_cast<uv_tcp_t*>(malloc(sizeof(uv_tcp_t)));
-        UV_CHECK_OK(uv_tcp_init(uv_loop(), uv_handle));
-        uv_handle->data = this;
-        uv_connect_t* req = reinterpret_cast<uv_connect_t*>(malloc(sizeof(uv_connect_t)));
-        UV_CHECK_OK(uv_tcp_connect(req, uv_handle, (const struct sockaddr *)&addr,
-                                   &Engine::GatewayConnectCallback));
+
+    if (use_machnet_) {
+        // Machnet mode
+        CHECK(!machnet_ip_.empty()) << "machnet_ip must be set when use_machnet=true";
+        CHECK(!gateway_machnet_ip_.empty()) << "gateway_machnet_ip must be set when use_machnet=true";
+
+        // Initialize Machnet channel
+        auto* machnet_channel = machnet::MachnetChannel::Get();
+        CHECK(machnet_channel->Init()) << "Failed to initialize Machnet";
+
+        // Create connections to Gateway
+        int total_gateway_conn = num_io_workers_ * gateway_conn_per_worker_;
+        for (int i = 0; i < total_gateway_conn; i++) {
+            auto conn = machnet_channel->CreateConnection(
+                machnet_ip_, gateway_machnet_ip_, gateway_port_);
+            CHECK(conn != nullptr) << "Failed to create Machnet connection to Gateway";
+
+            conn->SetMessageCallback(
+                [this](const GatewayMessage& msg, std::span<const char> payload) {
+                    OnRecvMachnetGatewayMessage(msg, payload);
+                });
+
+            // Send handshake to Gateway
+            GatewayMessage handshake = protocol::NewEngineHandshakeGatewayMessage(node_id_, i);
+            conn->SendMessage(handshake, std::span<const char>());
+
+            machnet_connections_.push_back(std::move(conn));
+        }
+
+        // Setup polling callback
+        UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
+        machnet_poll_prepare_.data = this;
+        UV_CHECK_OK(uv_prepare_start(&machnet_poll_prepare_, &Engine::MachnetPollCallback));
+
+        HLOG(INFO) << fmt::format("Created {} Machnet connections to Gateway at {}:{}",
+                                  total_gateway_conn, gateway_machnet_ip_, gateway_port_);
+    } else {
+        // TCP mode
+        struct sockaddr_in addr;
+        if (!utils::FillTcpSocketAddr(&addr, gateway_addr_, gateway_port_)) {
+            HLOG(FATAL) << "Failed to fill socker address for " << gateway_addr_;
+        }
+        int total_gateway_conn = num_io_workers_ * gateway_conn_per_worker_;
+        for (int i = 0; i < total_gateway_conn; i++) {
+            uv_tcp_t* uv_handle = reinterpret_cast<uv_tcp_t*>(malloc(sizeof(uv_tcp_t)));
+            UV_CHECK_OK(uv_tcp_init(uv_loop(), uv_handle));
+            uv_handle->data = this;
+            uv_connect_t* req = reinterpret_cast<uv_connect_t*>(malloc(sizeof(uv_connect_t)));
+            UV_CHECK_OK(uv_tcp_connect(req, uv_handle, (const struct sockaddr *)&addr,
+                                       &Engine::GatewayConnectCallback));
+        }
     }
     // Listen on ipc_path
     if (engine_tcp_port_ == -1) {
@@ -118,6 +161,7 @@ void Engine::StartInternal() {
         HLOG(INFO) << fmt::format("Listen on {} for IPC connections", ipc_path);
         uv_handle_ = UV_AS_STREAM(pipe_handle);
     } else {
+        struct sockaddr_in addr;
         uv_tcp_t* tcp_handle = reinterpret_cast<uv_tcp_t*>(malloc(sizeof(uv_tcp_t)));
         UV_CHECK_OK(uv_tcp_init(uv_loop(), tcp_handle));
         tcp_handle->data = this;
@@ -380,31 +424,55 @@ void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char>
 void Engine::ExternalFuncCallCompleted(const protocol::FuncCall& func_call,
                                        std::span<const char> output, int32_t processing_time) {
     inflight_external_requests_.fetch_add(-1);
-    server::IOWorker* io_worker = server::IOWorker::current();
-    DCHECK(io_worker != nullptr);
-    server::ConnectionBase* gateway_connection = io_worker->PickConnection(
-        GatewayConnection::kTypeId);
-    if (gateway_connection == nullptr) {
-        HLOG(ERROR) << "There is not GatewayConnection associated with current IOWorker";
-        return;
-    }
     GatewayMessage message = NewFuncCallCompleteGatewayMessage(func_call, processing_time);
     message.payload_size = output.size();
-    gateway_connection->as_ptr<GatewayConnection>()->SendMessage(message, output);
+
+    if (use_machnet_) {
+        // Machnet mode
+        auto* machnet_conn = PickMachnetGatewayConnection();
+        if (machnet_conn != nullptr) {
+            machnet_conn->SendMessage(message, output);
+        } else {
+            HLOG(ERROR) << "There is no Machnet gateway connection available";
+        }
+    } else {
+        // TCP mode
+        server::IOWorker* io_worker = server::IOWorker::current();
+        DCHECK(io_worker != nullptr);
+        server::ConnectionBase* gateway_connection = io_worker->PickConnection(
+            GatewayConnection::kTypeId);
+        if (gateway_connection == nullptr) {
+            HLOG(ERROR) << "There is not GatewayConnection associated with current IOWorker";
+            return;
+        }
+        gateway_connection->as_ptr<GatewayConnection>()->SendMessage(message, output);
+    }
 }
 
 void Engine::ExternalFuncCallFailed(const protocol::FuncCall& func_call, int status_code) {
     inflight_external_requests_.fetch_add(-1);
-    server::IOWorker* io_worker = server::IOWorker::current();
-    DCHECK(io_worker != nullptr);
-    server::ConnectionBase* gateway_connection = io_worker->PickConnection(
-        GatewayConnection::kTypeId);
-    if (gateway_connection == nullptr) {
-        HLOG(ERROR) << "There is not GatewayConnection associated with current IOWorker";
-        return;
-    }
     GatewayMessage message = NewFuncCallFailedGatewayMessage(func_call, status_code);
-    gateway_connection->as_ptr<GatewayConnection>()->SendMessage(message);
+
+    if (use_machnet_) {
+        // Machnet mode
+        auto* machnet_conn = PickMachnetGatewayConnection();
+        if (machnet_conn != nullptr) {
+            machnet_conn->SendMessage(message, std::span<const char>());
+        } else {
+            HLOG(ERROR) << "There is no Machnet gateway connection available";
+        }
+    } else {
+        // TCP mode
+        server::IOWorker* io_worker = server::IOWorker::current();
+        DCHECK(io_worker != nullptr);
+        server::ConnectionBase* gateway_connection = io_worker->PickConnection(
+            GatewayConnection::kTypeId);
+        if (gateway_connection == nullptr) {
+            HLOG(ERROR) << "There is not GatewayConnection associated with current IOWorker";
+            return;
+        }
+        gateway_connection->as_ptr<GatewayConnection>()->SendMessage(message);
+    }
 }
 
 Dispatcher* Engine::GetOrCreateDispatcher(uint16_t func_id) {
@@ -525,6 +593,35 @@ UV_CONNECTION_CB_FOR_CLASS(Engine, MessageConnection) {
         LOG(ERROR) << "Failed to accept new message connection";
         free(client);
     }
+}
+
+// ============================================================================
+// Machnet support methods
+// ============================================================================
+
+void Engine::OnRecvMachnetGatewayMessage(const GatewayMessage& message,
+                                          std::span<const char> payload) {
+    // Only dispatch messages are expected from Gateway
+    if (protocol::IsDispatchFuncCallMessage(message)) {
+        FuncCall func_call = GetFuncCallFromMessage(message);
+        OnExternalFuncCall(func_call, payload);
+    } else {
+        HLOG(ERROR) << "Unknown Machnet gateway message type";
+    }
+}
+
+machnet::MachnetConnection* Engine::PickMachnetGatewayConnection() {
+    if (machnet_connections_.empty()) {
+        return nullptr;
+    }
+    // Round-robin selection
+    size_t idx = next_machnet_conn_idx_.fetch_add(1) % machnet_connections_.size();
+    return machnet_connections_[idx].get();
+}
+
+void Engine::MachnetPollCallback(uv_prepare_t* handle) {
+    (void)handle;  // Unused parameter
+    machnet::MachnetChannel::Get()->Poll();
 }
 
 }  // namespace engine

@@ -6,6 +6,7 @@
 #include "common/stat.h"
 #include "common/protocol.h"
 #include "common/func_config.h"
+#include "common/machnet_transport.h"
 #include "server/server_base.h"
 #include "gateway/func_call_context.h"
 #include "gateway/http_connection.h"
@@ -32,6 +33,8 @@ public:
     void set_func_config_file(std::string_view path) {
         func_config_file_ = std::string(path);
     }
+    void set_use_machnet(bool value) { use_machnet_ = value; }
+    void set_machnet_ip(std::string_view ip) { machnet_ip_ = std::string(ip); }
     FuncConfig* func_config() { return &func_config_; }
 
     // Must be thread-safe
@@ -53,6 +56,14 @@ private:
     std::string func_config_file_;
     std::string func_config_json_;
     FuncConfig func_config_;
+
+    // Machnet support
+    bool use_machnet_;
+    std::string machnet_ip_;
+    std::unique_ptr<machnet::MachnetListener> machnet_listener_;
+    uv_prepare_t machnet_poll_prepare_;
+    absl::flat_hash_map</* node_id */ uint16_t, machnet::MachnetConnection*>
+        machnet_engine_connections_;
 
     uv_tcp_t uv_engine_conn_handle_;
     uv_tcp_t uv_http_handle_;
@@ -131,6 +142,14 @@ private:
     void TickNewFuncCall(uint16_t func_id, int64_t current_timestamp)
         ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
     uint16_t PickNextNode(const protocol::FuncCall& func_call) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
+
+    // Machnet support
+    void OnNewMachnetEngineConnection(machnet::MachnetConnection* connection);
+    void OnRecvMachnetEngineMessage(machnet::MachnetConnection* connection,
+                                     const protocol::GatewayMessage& message,
+                                     std::span<const char> payload);
+    machnet::MachnetConnection* GetMachnetEngineConnection(uint16_t node_id);
+    static void MachnetPollCallback(uv_prepare_t* handle);
 
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(HttpConnection);
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(GrpcConnection);

@@ -14,6 +14,8 @@ ABSL_FLAG(int, http_port, 8080, "Port for HTTP connections");
 ABSL_FLAG(int, grpc_port, 50051, "Port for gRPC connections");
 ABSL_FLAG(int, num_io_workers, 1, "Number of IO workers.");
 ABSL_FLAG(std::string, func_config_file, "", "Path to function config file");
+ABSL_FLAG(bool, use_machnet, false, "Use Machnet instead of TCP for engine connections");
+ABSL_FLAG(std::string, machnet_ip, "", "Machnet IP address (required if use_machnet=true)");
 
 static std::atomic<faas::gateway::Server*> server_ptr(nullptr);
 void SignalHandlerToStopServer(int signal) {
@@ -34,6 +36,8 @@ int main(int argc, char* argv[]) {
     server->set_grpc_port(absl::GetFlag(FLAGS_grpc_port));
     server->set_num_io_workers(absl::GetFlag(FLAGS_num_io_workers));
     server->set_func_config_file(absl::GetFlag(FLAGS_func_config_file));
+    server->set_use_machnet(absl::GetFlag(FLAGS_use_machnet));
+    server->set_machnet_ip(absl::GetFlag(FLAGS_machnet_ip));
 
     server->Start();
     server_ptr.store(server.get());

@@ -17,14 +17,15 @@ DCOMPILE_FLAGS = -DDEBUG -g
 INCLUDES = -I$(SRC_PATH) -I./include -I./deps/out/include \
 	-DFMT_HEADER_ONLY -I./deps/fmt/include \
 	-I./deps/GSL/include \
-	-I./deps/json/single_include
+	-I./deps/json/single_include \
+	-I./deps/machnet/src/include -I./deps/machnet/src/ext
 # General linker settings
 ABSL_LIBRARIES = $(shell find deps/out/lib/libabsl_*.a -printf '%f\n' \
                    | sed -e 's/libabsl_\([a-z0-9_]\+\)\.a/-labsl_\1/g')
-LINK_FLAGS = -Ldeps/out/lib \
+LINK_FLAGS = -Ldeps/out/lib -L./deps/machnet \
     -Wl,-Bstatic -luv_a -lhttp_parser -lnghttp2 \
     -Wl,--start-group $(ABSL_LIBRARIES) -Wl,--end-group \
-    -Wl,-Bdynamic -lpthread -ldl -Wl,--gc-sections
+    -Wl,-Bdynamic -lmachnet_shim -lrt -lgflags -lpthread -ldl -Wl,--gc-sections,-rpath,$(abspath ./deps/machnet)
 # Additional release-specific linker settings
 RLINK_FLAGS =
 # Additional debug-specific linker settings

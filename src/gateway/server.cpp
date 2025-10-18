@@ -38,6 +38,7 @@ Server::Server()
       listen_backlog_(kDefaultListenBackLog),
       num_io_workers_(kDefaultNumIOWorkers),
       max_running_requests_(0),
+      use_machnet_(false),
       next_http_conn_worker_id_(0),
       next_grpc_conn_worker_id_(0),
       next_http_connection_id_(0),
@@ -86,14 +87,41 @@ void Server::StartInternal() {
     CHECK(!address_.empty());
     CHECK_NE(engine_conn_port_, -1);
     CHECK_NE(http_port_, -1);
-    // Listen on address:engine_conn_port for engine connections
-    UV_CHECK_OK(uv_ip4_addr(address_.c_str(), engine_conn_port_, &bind_addr));
-    UV_CHECK_OK(uv_tcp_bind(&uv_engine_conn_handle_, (const struct sockaddr *)&bind_addr, 0));
-    HLOG(INFO) << fmt::format("Listen on {}:{} for engine connections",
-                              address_, engine_conn_port_);
-    UV_CHECK_OK(uv_listen(
-        UV_AS_STREAM(&uv_engine_conn_handle_), listen_backlog_,
-        &Server::EngineConnectionCallback));
+
+    // Listen for engine connections (TCP or Machnet)
+    if (use_machnet_) {
+        CHECK(!machnet_ip_.empty()) << "machnet_ip must be set when use_machnet=true";
+
+        // Initialize Machnet channel
+        auto* machnet_channel = machnet::MachnetChannel::Get();
+        CHECK(machnet_channel->Init()) << "Failed to initialize Machnet";
+
+        // Create Machnet listener
+        machnet_listener_ = machnet_channel->CreateListener(machnet_ip_, engine_conn_port_);
+        CHECK(machnet_listener_ != nullptr) << "Failed to create Machnet listener";
+
+        machnet_listener_->SetNewConnectionCallback(
+            [this](machnet::MachnetConnection* conn) {
+                OnNewMachnetEngineConnection(conn);
+            });
+
+        // Setup polling callback
+        UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
+        machnet_poll_prepare_.data = this;
+        UV_CHECK_OK(uv_prepare_start(&machnet_poll_prepare_, &Server::MachnetPollCallback));
+
+        HLOG(INFO) << fmt::format("Listening on Machnet {}:{} for engine connections",
+                                  machnet_ip_, engine_conn_port_);
+    } else {
+        // TCP mode
+        UV_CHECK_OK(uv_ip4_addr(address_.c_str(), engine_conn_port_, &bind_addr));
+        UV_CHECK_OK(uv_tcp_bind(&uv_engine_conn_handle_, (const struct sockaddr *)&bind_addr, 0));
+        HLOG(INFO) << fmt::format("Listen on {}:{} for engine connections",
+                                  address_, engine_conn_port_);
+        UV_CHECK_OK(uv_listen(
+            UV_AS_STREAM(&uv_engine_conn_handle_), listen_backlog_,
+            &Server::EngineConnectionCallback));
+    }
     // Listen on address:http_port for HTTP requests
     UV_CHECK_OK(uv_ip4_addr(address_.c_str(), http_port_, &bind_addr));
     UV_CHECK_OK(uv_tcp_bind(&uv_http_handle_, (const struct sockaddr *)&bind_addr, 0));
@@ -352,24 +380,45 @@ void Server::OnNewFuncCallCommon(std::shared_ptr<server::ConnectionBase> parent_
 void Server::DispatchFuncCall(std::shared_ptr<server::ConnectionBase> parent_connection,
                               FuncCallContext* func_call_context, uint16_t node_id) {
     FuncCall func_call = func_call_context->func_call();
-    server::IOWorker* io_worker = server::IOWorker::current();
-    DCHECK(io_worker != nullptr);
-    server::ConnectionBase* engine_connection = io_worker->PickConnection(
-        EngineConnection::type_id(node_id));
-    if (engine_connection != nullptr) {
-        GatewayMessage dispatch_message = NewDispatchFuncCallGatewayMessage(func_call);
-        dispatch_message.payload_size = func_call_context->input().size();
-        engine_connection->as_ptr<EngineConnection>()->SendMessage(
-            dispatch_message, func_call_context->input());
-    } else {
-        HLOG(WARNING) << "There is no engine connection for node_id=" << node_id;
-        {
-            absl::MutexLock lk(&mu_);
-            DCHECK(running_func_calls_.contains(func_call.full_call_id));
-            running_func_calls_.erase(func_call.full_call_id);
+
+    if (use_machnet_) {
+        // Machnet mode
+        auto* machnet_conn = GetMachnetEngineConnection(node_id);
+        if (machnet_conn != nullptr) {
+            GatewayMessage dispatch_message = NewDispatchFuncCallGatewayMessage(func_call);
+            dispatch_message.payload_size = func_call_context->input().size();
+            machnet_conn->SendMessage(dispatch_message, func_call_context->input());
+        } else {
+            HLOG(WARNING) << "There is no Machnet engine connection for node_id=" << node_id;
+            {
+                absl::MutexLock lk(&mu_);
+                DCHECK(running_func_calls_.contains(func_call.full_call_id));
+                running_func_calls_.erase(func_call.full_call_id);
+            }
+            func_call_context->set_status(FuncCallContext::kNotFound);
+            FinishFuncCall(std::move(parent_connection), func_call_context);
         }
-        func_call_context->set_status(FuncCallContext::kNotFound);
-        FinishFuncCall(std::move(parent_connection), func_call_context);
+    } else {
+        // TCP mode
+        server::IOWorker* io_worker = server::IOWorker::current();
+        DCHECK(io_worker != nullptr);
+        server::ConnectionBase* engine_connection = io_worker->PickConnection(
+            EngineConnection::type_id(node_id));
+        if (engine_connection != nullptr) {
+            GatewayMessage dispatch_message = NewDispatchFuncCallGatewayMessage(func_call);
+            dispatch_message.payload_size = func_call_context->input().size();
+            engine_connection->as_ptr<EngineConnection>()->SendMessage(
+                dispatch_message, func_call_context->input());
+        } else {
+            HLOG(WARNING) << "There is no engine connection for node_id=" << node_id;
+            {
+                absl::MutexLock lk(&mu_);
+                DCHECK(running_func_calls_.contains(func_call.full_call_id));
+                running_func_calls_.erase(func_call.full_call_id);
+            }
+            func_call_context->set_status(FuncCallContext::kNotFound);
+            FinishFuncCall(std::move(parent_connection), func_call_context);
+        }
     }
 }
 
@@ -558,6 +607,136 @@ UV_READ_CB_FOR_CLASS(Server::OngoingEngineHandshake, ReadMessage) {
         UV_DCHECK_OK(uv_read_stop(UV_AS_STREAM(uv_handle_)));
         OnReadHandshakeMessage();
     }
+}
+
+// ============================================================================
+// Machnet support methods
+// ============================================================================
+
+void Server::OnNewMachnetEngineConnection(machnet::MachnetConnection* connection) {
+    // Extract node_id from the first message (will be handshake)
+    // Set message callback to handle incoming messages from this engine connection
+    // Capture the connection pointer so we can store it when we get the handshake
+
+    connection->SetMessageCallback(
+        [this, connection](const GatewayMessage& msg, std::span<const char> payload) {
+            OnRecvMachnetEngineMessage(connection, msg, payload);
+        });
+
+    HLOG(INFO) << "New Machnet engine connection established";
+}
+
+void Server::OnRecvMachnetEngineMessage(machnet::MachnetConnection* connection,
+                                         const GatewayMessage& message,
+                                         std::span<const char> payload) {
+    // Handle handshake
+    if (IsEngineHandshakeMessage(message)) {
+        uint16_t node_id = message.node_id;
+
+        // Store the connection for this node_id
+        machnet_engine_connections_[node_id] = connection;
+
+        // Register this node
+        if (!connected_node_set_.contains(node_id)) {
+            connected_node_set_.insert(node_id);
+            absl::MutexLock lk(&mu_);
+            connected_nodes_.push_back(node_id);
+            dispatched_requests_stat_.emplace_back(new stat::Counter(
+                stat::Counter::StandardReportCallback(fmt::format("dispatched_requests[{}]", node_id))));
+            HLOG(INFO) << "Number of connected Machnet nodes: " << connected_nodes_.size();
+            max_running_requests_ = absl::GetFlag(FLAGS_max_running_requests) * connected_nodes_.size();
+        }
+
+        // Note: In Machnet mode, the connection is already established via the listener callback
+        // We don't need to send a handshake response for Machnet
+        HLOG(INFO) << fmt::format("Machnet engine handshake from node_id={}", node_id);
+        return;
+    }
+
+    // Handle function call responses (same logic as TCP version)
+    if (IsFuncCallCompleteMessage(message) || IsFuncCallFailedMessage(message)) {
+        // Reuse the existing OnRecvEngineMessage logic by creating a fake EngineConnection
+        // Or better, extract the common logic
+
+        int64_t current_timestamp = GetMonotonicMicroTimestamp();
+        FuncCall func_call = GetFuncCallFromMessage(message);
+        FuncCallContext* func_call_context = nullptr;
+        std::shared_ptr<server::ConnectionBase> connection;
+        FuncCallContext* next_func_call = nullptr;
+        std::shared_ptr<server::ConnectionBase> next_connection;
+        uint16_t node_id = 0;
+        {
+            absl::MutexLock lk(&mu_);
+            if (running_func_calls_.contains(func_call.full_call_id)) {
+                const FuncCallState& full_call_state = running_func_calls_[func_call.full_call_id];
+                if (connections_.contains(full_call_state.connection_id)
+                      && !discarded_func_calls_.contains(func_call.full_call_id)) {
+                    connection = connections_[full_call_state.connection_id];
+                    func_call_context = full_call_state.context;
+                }
+                if (discarded_func_calls_.contains(func_call.full_call_id)) {
+                    discarded_func_calls_.erase(func_call.full_call_id);
+                }
+                dispatch_overhead_stat_.AddSample(gsl::narrow_cast<int32_t>(
+                    current_timestamp - full_call_state.dispatch_timestamp - message.processing_time));
+                running_func_calls_.erase(func_call.full_call_id);
+                FuncCallState state;
+                if (max_running_requests_ == 0 || running_func_calls_.size() < max_running_requests_) {
+                    while (!pending_func_calls_.empty()) {
+                        state = std::move(pending_func_calls_.front());
+                        pending_func_calls_.pop();
+                        if (discarded_func_calls_.contains(state.func_call.full_call_id)) {
+                            discarded_func_calls_.erase(state.func_call.full_call_id);
+                            continue;
+                        }
+                        if (connections_.contains(state.connection_id)) {
+                            next_connection = connections_[state.connection_id];
+                            next_func_call = state.context;
+                            break;
+                        }
+                    }
+                }
+                // Note: For Machnet, we don't track per-node request counts the same way
+                if (next_func_call != nullptr) {
+                    FuncCall func_call = next_func_call->func_call();
+                    state.dispatch_timestamp = current_timestamp;
+                    queueing_delay_stat_.AddSample(gsl::narrow_cast<int32_t>(
+                        current_timestamp - state.recv_timestamp));
+                    running_func_calls_[func_call.full_call_id] = std::move(state);
+                    node_id = PickNextNode(func_call);
+                    running_requests_stat_.AddSample(
+                        gsl::narrow_cast<uint16_t>(running_func_calls_.size()));
+                }
+            }
+        }
+        if (func_call_context != nullptr) {
+            if (IsFuncCallCompleteMessage(message)) {
+                func_call_context->set_status(FuncCallContext::kSuccess);
+                func_call_context->append_output(payload);
+            } else if (IsFuncCallFailedMessage(message)) {
+                func_call_context->set_status(FuncCallContext::kFailed);
+            }
+            FinishFuncCall(std::move(connection), func_call_context);
+        }
+        if (next_func_call != nullptr) {
+            DispatchFuncCall(std::move(next_connection), next_func_call, node_id);
+        }
+    } else {
+        HLOG(ERROR) << "Unknown Machnet engine message type";
+    }
+}
+
+machnet::MachnetConnection* Server::GetMachnetEngineConnection(uint16_t node_id) {
+    auto it = machnet_engine_connections_.find(node_id);
+    if (it != machnet_engine_connections_.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+void Server::MachnetPollCallback(uv_prepare_t* handle) {
+    (void)handle;  // Unused parameter
+    machnet::MachnetChannel::Get()->Poll();
 }
 
 }  // namespace gateway

@@ -4,6 +4,7 @@
 #include "common/uv.h"
 #include "common/protocol.h"
 #include "common/func_config.h"
+#include "common/machnet_transport.h"
 #include "ipc/shm_region.h"
 #include "server/server_base.h"
 #include "engine/gateway_connection.h"
@@ -39,6 +40,9 @@ public:
     void set_engine_tcp_port(int port) {
         engine_tcp_port_ = port;
     }
+    void set_use_machnet(bool value) { use_machnet_ = value; }
+    void set_machnet_ip(std::string_view ip) { machnet_ip_ = std::string(ip); }
+    void set_gateway_machnet_ip(std::string_view ip) { gateway_machnet_ip_ = std::string(ip); }
 
     uint16_t node_id() const { return node_id_; }
     FuncConfig* func_config() { return &func_config_; }
@@ -75,6 +79,14 @@ private:
     FuncConfig func_config_;
     bool func_worker_use_engine_socket_;
     bool use_fifo_for_nested_call_;
+
+    // Machnet support
+    bool use_machnet_;
+    std::string machnet_ip_;
+    std::string gateway_machnet_ip_;
+    std::vector<std::unique_ptr<machnet::MachnetConnection>> machnet_connections_;
+    uv_prepare_t machnet_poll_prepare_;
+    std::atomic<size_t> next_machnet_conn_idx_;
 
     uv_stream_t* uv_handle_;
 
@@ -122,6 +134,12 @@ private:
     std::unique_ptr<ipc::ShmRegion> GrabExternalFuncCallShmInput(
             const protocol::FuncCall& func_call) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
     void ProcessDiscardedFuncCallIfNecessary();
+
+    // Machnet support
+    void OnRecvMachnetGatewayMessage(const protocol::GatewayMessage& message,
+                                      std::span<const char> payload);
+    machnet::MachnetConnection* PickMachnetGatewayConnection();
+    static void MachnetPollCallback(uv_prepare_t* handle);
 
     DECLARE_UV_CONNECT_CB_FOR_CLASS(GatewayConnect);
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(MessageConnection);

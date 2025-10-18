@@ -21,6 +21,9 @@ ABSL_FLAG(int, node_id, -1,
 ABSL_FLAG(std::string, root_path_for_ipc, "/dev/shm/faas_ipc",
           "Root directory for IPCs used by FaaS");
 ABSL_FLAG(std::string, func_config_file, "", "Path to function config file");
+ABSL_FLAG(bool, use_machnet, false, "Use Machnet instead of TCP for gateway connections");
+ABSL_FLAG(std::string, machnet_ip, "", "Machnet IP address for Engine (required if use_machnet=true)");
+ABSL_FLAG(std::string, gateway_machnet_ip, "", "Gateway's Machnet IP address (required if use_machnet=true)");
 
 static std::atomic<faas::engine::Engine*> engine_ptr(nullptr);
 static void SignalHandlerToStopEngine(int signal) {
@@ -66,6 +69,9 @@ int main(int argc, char* argv[]) {
         engine->set_node_id(gsl::narrow_cast<uint16_t>(node_id));
     }
     engine->set_func_config_file(absl::GetFlag(FLAGS_func_config_file));
+    engine->set_use_machnet(absl::GetFlag(FLAGS_use_machnet));
+    engine->set_machnet_ip(absl::GetFlag(FLAGS_machnet_ip));
+    engine->set_gateway_machnet_ip(absl::GetFlag(FLAGS_gateway_machnet_ip));
 
     engine->Start();
     engine_ptr.store(engine.get());
