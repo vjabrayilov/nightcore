@@ -87,9 +87,13 @@ void Dispatcher::OnFuncWorkerDisconnected(FuncWorker* func_worker) {
 bool Dispatcher::OnNewFuncCall(const FuncCall& func_call, const FuncCall& parent_func_call,
                                size_t input_size, std::span<const char> inline_input,
                                bool shm_input) {
-    VLOG(1) << "OnNewFuncCall " << FuncCallDebugString(func_call);
     DCHECK_EQ(func_id_, func_call.func_id);
     absl::MutexLock lk(&mu_);
+
+    HLOG(INFO) << fmt::format("OnNewFuncCall: input_size={}, total_workers={}, idle={}, running={}, pending={}",
+                              input_size, workers_.size(), idle_workers_.size(),
+                              running_workers_.size(), pending_func_calls_.size());
+
     Message* dispatch_func_call_message = message_pool_.Get();
     *dispatch_func_call_message = NewDispatchFuncCallMessage(func_call);
     if (shm_input) {
@@ -102,9 +106,11 @@ bool Dispatcher::OnNewFuncCall(const FuncCall& func_call, const FuncCall& parent
         func_call, parent_func_call, input_size);
     FuncWorker* idle_worker = PickIdleWorker();
     if (idle_worker) {
+        HLOG(INFO) << fmt::format("Dispatching to worker client_id={}", idle_worker->client_id());
         DispatchFuncCall(idle_worker, dispatch_func_call_message);
     } else {
-        VLOG(1) << "No idle worker at the moment";
+        HLOG(WARNING) << fmt::format("No idle worker! Queuing request (pending_count={})",
+                                     pending_func_calls_.size() + 1);
         pending_func_calls_.push({
             .dispatch_func_call_message = dispatch_func_call_message,
             .func_call_info = func_call_info

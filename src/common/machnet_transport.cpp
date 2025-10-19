@@ -216,40 +216,23 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
 void MachnetConnection::Poll() {
     constexpr size_t kBufferSize = 65536;
     static char buffer[kBufferSize];
-    static int poll_call_count = 0;
-    static int last_recv_count_logged = 0;
-
-    poll_call_count++;
-
-    // Log first few calls to confirm polling is happening
-    if (poll_call_count <= 3) {
-        LOG(INFO) << fmt::format("MachnetConnection::Poll() call #{}, channel={:p}, my flow={}:{} -> {}:{}",
-                                poll_call_count, channel_, flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port);
-    }
 
     MachnetFlow_t recv_flow;
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
 
     if (ret > 0) {
-        LOG(INFO) << fmt::format("Connection Poll received {} bytes from flow {}:{} -> {}:{} (channel={:p})",
-                                ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port, channel_);
+        LOG(INFO) << fmt::format("Machnet received {} bytes from flow {}:{} -> {}:{}",
+                                ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port);
         read_buffer_.AppendData(buffer, ret);
         ProcessMessages();
-    } else if (ret == 0) {
-        // No data available - log occasionally to confirm polling is happening
-        if (poll_call_count - last_recv_count_logged >= 1000) {
-            LOG(INFO) << fmt::format("Connection Poll: machnet_recv returned 0 (no data), called {} times total, channel={:p}",
-                                    poll_call_count, channel_);
-            last_recv_count_logged = poll_call_count;
-        }
-    } else {
-        LOG(ERROR) << fmt::format("machnet_recv() failed with error: {}, channel={:p}", ret, channel_);
+    } else if (ret < 0) {
+        LOG(ERROR) << fmt::format("machnet_recv() failed with error: {}", ret);
     }
+    // ret == 0 means no data, which is normal - don't log
 }
 
 void MachnetConnection::ProcessMessages() {
     // Process all complete messages in the buffer
-    LOG(INFO) << fmt::format("ProcessMessages: buffer has {} bytes", read_buffer_.length());
     while (read_buffer_.length() >= sizeof(protocol::GatewayMessage)) {
         auto* message = reinterpret_cast<const protocol::GatewayMessage*>(
             read_buffer_.data());
@@ -257,16 +240,13 @@ void MachnetConnection::ProcessMessages() {
         size_t full_size = sizeof(protocol::GatewayMessage) +
                           std::max<size_t>(0, message->payload_size);
 
-        LOG(INFO) << fmt::format("Message header received, payload_size={}, full_size={}, buffer_length={}",
-                                message->payload_size, full_size, read_buffer_.length());
-
         if (read_buffer_.length() >= full_size) {
             // Complete message available
             std::span<const char> payload(
                 read_buffer_.data() + sizeof(protocol::GatewayMessage),
                 full_size - sizeof(protocol::GatewayMessage));
 
-            LOG(INFO) << "Invoking message callback";
+            LOG(INFO) << fmt::format("Machnet message complete: header + {} bytes payload", payload.size());
             if (message_callback_) {
                 message_callback_(*message, payload);
             } else {
@@ -276,7 +256,8 @@ void MachnetConnection::ProcessMessages() {
             read_buffer_.ConsumeFront(full_size);
         } else {
             // Incomplete message, wait for more data
-            LOG(INFO) << "Incomplete message, waiting for more data";
+            VLOG(1) << fmt::format("Incomplete message: have {}, need {} bytes",
+                                   read_buffer_.length(), full_size);
             break;
         }
     }

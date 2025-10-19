@@ -369,12 +369,17 @@ void Engine::OnRecvMessage(MessageConnection* connection, const Message& message
 }
 
 void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char> input) {
+    HLOG(INFO) << fmt::format("OnExternalFuncCall: func_id={}, input={} bytes",
+                              func_call.func_id, input.size());
+
     inflight_external_requests_.fetch_add(1);
     std::unique_ptr<ipc::ShmRegion> input_region = nullptr;
     if (input.size() > MESSAGE_INLINE_DATA_SIZE) {
+        HLOG(INFO) << "Creating shared memory for large input";
         input_region = ipc::ShmCreate(
             ipc::GetFuncCallInputShmName(func_call.full_call_id), input.size());
         if (input_region == nullptr) {
+            HLOG(ERROR) << "Failed to create shared memory for input";
             ExternalFuncCallFailed(func_call);
             return;
         }
@@ -407,9 +412,14 @@ void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char>
         }
     }
     if (dispatcher == nullptr) {
+        HLOG(ERROR) << fmt::format("No dispatcher found for func_id={}", func_call.func_id);
         ExternalFuncCallFailed(func_call);
         return;
     }
+
+    HLOG(INFO) << fmt::format("Dispatching to Dispatcher[{}], input_size={}, use_shm={}",
+                              func_call.func_id, input.size(), input.size() > MESSAGE_INLINE_DATA_SIZE);
+
     bool success = false;
     if (input.size() <= MESSAGE_INLINE_DATA_SIZE) {
         success = dispatcher->OnNewFuncCall(
@@ -420,12 +430,16 @@ void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char>
             func_call, protocol::kInvalidFuncCall,
             input.size(), /* inline_input= */ std::span<const char>(), /* shm_input= */ true);
     }
+
     if (!success) {
+        HLOG(ERROR) << fmt::format("Dispatcher[{}] failed to dispatch func_call", func_call.func_id);
         {
             absl::MutexLock lk(&mu_);
             input_region = GrabExternalFuncCallShmInput(func_call);
         }
         ExternalFuncCallFailed(func_call);
+    } else {
+        HLOG(INFO) << fmt::format("Dispatcher[{}] successfully accepted func_call", func_call.func_id);
     }
 }
 
@@ -609,11 +623,12 @@ UV_CONNECTION_CB_FOR_CLASS(Engine, MessageConnection) {
 
 void Engine::OnRecvMachnetGatewayMessage(const GatewayMessage& message,
                                           std::span<const char> payload) {
-    HLOG(INFO) << fmt::format("OnRecvMachnetGatewayMessage: payload_size={}", payload.size());
     // Only dispatch messages are expected from Gateway
     if (protocol::IsDispatchFuncCallMessage(message)) {
-        HLOG(INFO) << "Received dispatch func call message from Gateway";
         FuncCall func_call = GetFuncCallFromMessage(message);
+        HLOG(INFO) << fmt::format("Machnet dispatch: func_id={}, call_id={:#x}, payload={} bytes",
+                                  static_cast<uint16_t>(func_call.func_id),
+                                  func_call.full_call_id, payload.size());
         OnExternalFuncCall(func_call, payload);
     } else {
         HLOG(ERROR) << "Unknown Machnet gateway message type";
@@ -630,41 +645,15 @@ machnet::MachnetConnection* Engine::PickMachnetGatewayConnection() {
 }
 
 void Engine::DoMachnetPoll() {
-    static int poll_count = 0;
-    static int64_t last_poll_timestamp = 0;
-    poll_count++;
-
-    int64_t now = GetMonotonicMicroTimestamp();
-    if (last_poll_timestamp > 0) {
-        int64_t gap = now - last_poll_timestamp;
-        if (gap > 100000) {  // 100ms gap - warn if polling is too slow
-            LOG(WARNING) << fmt::format("Engine DoMachnetPoll: Large gap detected! {} us since last poll", gap);
-        }
-    }
-    last_poll_timestamp = now;
-
-    // Log immediately on first few calls
-    if (poll_count <= 10) {
-        HLOG(INFO) << fmt::format("Engine DoMachnetPoll: Call #{} with {} connections",
-                                  poll_count, machnet_connections_.size());
-    } else if (poll_count % 100 == 0) {
-        HLOG(INFO) << fmt::format("Engine DoMachnetPoll called {} times", poll_count);
-    }
-
     // Wrap in try-catch to ensure polling never crashes
     try {
-        // IMPORTANT: On Engine side, all connections share the same channel.
-        // We should poll the channel ONCE and route messages to the appropriate connection.
-        // Currently we just poll all connections since they're all waiting for responses from Gateway.
-        // Each connection will call machnet_recv(), but only the first non-empty one will succeed.
+        // Poll all Engine connections to Gateway
         for (size_t i = 0; i < machnet_connections_.size(); i++) {
             if (machnet_connections_[i] != nullptr) {
                 machnet_connections_[i]->Poll();
-            } else {
-                LOG(WARNING) << fmt::format("Engine DoMachnetPoll: Connection {} is null!", i);
             }
         }
-        // Also poll the channel's listeners (if any - Gateway has listeners, Engine doesn't)
+        // Also poll the channel's listeners (Gateway has listeners, Engine doesn't)
         machnet::MachnetChannel::Get()->Poll();
     } catch (const std::exception& e) {
         LOG(ERROR) << "Engine DoMachnetPoll: Exception caught: " << e.what();
@@ -685,19 +674,10 @@ void Engine::MachnetPollCallback(uv_prepare_t* handle) {
 }
 
 void Engine::MachnetTimerCallback(uv_timer_t* handle) {
-    static int timer_call_count = 0;
-    timer_call_count++;
-
-    if (timer_call_count <= 5) {
-        LOG(INFO) << fmt::format("Engine MachnetTimerCallback: Call #{}", timer_call_count);
-    }
-
-    // Verify handle data is valid
     if (handle == nullptr || handle->data == nullptr) {
-        LOG(ERROR) << "Engine MachnetTimerCallback: Invalid handle or data pointer!";
+        LOG(ERROR) << "Engine MachnetTimerCallback: Invalid handle pointer!";
         return;
     }
-
     Engine* engine = reinterpret_cast<Engine*>(handle->data);
     engine->DoMachnetPoll();
 }
