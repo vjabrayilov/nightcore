@@ -136,8 +136,19 @@ void MachnetListener::Poll() {
 
         if (it == connections_.end()) {
             // New connection from a remote peer
-            // Use the flow AS-IS - Machnet handles bidirectional communication
-            auto new_conn = std::make_unique<MachnetConnection>(channel_, flow);
+            // IMPORTANT: The received flow has src=remote, dst=local
+            // For sending responses, we need dst=remote, so SWAP src/dst
+            MachnetFlow_t send_flow;
+            send_flow.src_ip = flow.dst_ip;      // local IP becomes src
+            send_flow.src_port = flow.dst_port;  // local port becomes src
+            send_flow.dst_ip = flow.src_ip;      // remote IP becomes dst
+            send_flow.dst_port = flow.src_port;  // remote port becomes dst
+
+            LOG(INFO) << fmt::format("Creating connection with swapped flow: {}:{} -> {}:{}",
+                                    send_flow.src_ip, send_flow.src_port,
+                                    send_flow.dst_ip, send_flow.dst_port);
+
+            auto new_conn = std::make_unique<MachnetConnection>(channel_, send_flow);
             conn = new_conn.get();
             connections_[flow_id] = std::move(new_conn);
 
