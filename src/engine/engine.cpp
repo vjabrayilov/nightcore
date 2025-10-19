@@ -601,8 +601,10 @@ UV_CONNECTION_CB_FOR_CLASS(Engine, MessageConnection) {
 
 void Engine::OnRecvMachnetGatewayMessage(const GatewayMessage& message,
                                           std::span<const char> payload) {
+    HLOG(INFO) << fmt::format("OnRecvMachnetGatewayMessage: payload_size={}", payload.size());
     // Only dispatch messages are expected from Gateway
     if (protocol::IsDispatchFuncCallMessage(message)) {
+        HLOG(INFO) << "Received dispatch func call message from Gateway";
         FuncCall func_call = GetFuncCallFromMessage(message);
         OnExternalFuncCall(func_call, payload);
     } else {
@@ -620,7 +622,17 @@ machnet::MachnetConnection* Engine::PickMachnetGatewayConnection() {
 }
 
 void Engine::MachnetPollCallback(uv_prepare_t* handle) {
-    (void)handle;  // Unused parameter
+    Engine* engine = reinterpret_cast<Engine*>(handle->data);
+    static int poll_count = 0;
+    if (++poll_count % 1000 == 0) {
+        HLOG(INFO) << fmt::format("Engine MachnetPollCallback called {} times, {} connections",
+                                  poll_count, engine->machnet_connections_.size());
+    }
+    // Poll Engine's connections to Gateway
+    for (auto& conn : engine->machnet_connections_) {
+        conn->Poll();
+    }
+    // Also poll the channel (for listeners if any)
     machnet::MachnetChannel::Get()->Poll();
 }
 

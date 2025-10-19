@@ -125,6 +125,8 @@ void MachnetListener::Poll() {
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
 
     if (ret > 0) {
+        LOG(INFO) << fmt::format("Listener received {} bytes from flow {}:{} -> {}:{}",
+                                ret, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
         // New message received
         uint64_t flow_id = ((uint64_t)flow.src_ip << 32) |
                           ((uint64_t)flow.src_port << 16) | flow.dst_port;
@@ -208,6 +210,8 @@ void MachnetConnection::Poll() {
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
 
     if (ret > 0) {
+        LOG(INFO) << fmt::format("Connection Poll received {} bytes from flow {}:{} -> {}:{}",
+                                ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port);
         // Verify flow matches (optional, for safety)
         read_buffer_.AppendData(buffer, ret);
         ProcessMessages();
@@ -220,6 +224,7 @@ void MachnetConnection::Poll() {
 
 void MachnetConnection::ProcessMessages() {
     // Process all complete messages in the buffer
+    LOG(INFO) << fmt::format("ProcessMessages: buffer has {} bytes", read_buffer_.length());
     while (read_buffer_.length() >= sizeof(protocol::GatewayMessage)) {
         auto* message = reinterpret_cast<const protocol::GatewayMessage*>(
             read_buffer_.data());
@@ -227,19 +232,26 @@ void MachnetConnection::ProcessMessages() {
         size_t full_size = sizeof(protocol::GatewayMessage) +
                           std::max<size_t>(0, message->payload_size);
 
+        LOG(INFO) << fmt::format("Message header received, payload_size={}, full_size={}, buffer_length={}",
+                                message->payload_size, full_size, read_buffer_.length());
+
         if (read_buffer_.length() >= full_size) {
             // Complete message available
             std::span<const char> payload(
                 read_buffer_.data() + sizeof(protocol::GatewayMessage),
                 full_size - sizeof(protocol::GatewayMessage));
 
+            LOG(INFO) << "Invoking message callback";
             if (message_callback_) {
                 message_callback_(*message, payload);
+            } else {
+                LOG(WARNING) << "No message callback set!";
             }
 
             read_buffer_.ConsumeFront(full_size);
         } else {
             // Incomplete message, wait for more data
+            LOG(INFO) << "Incomplete message, waiting for more data";
             break;
         }
     }
