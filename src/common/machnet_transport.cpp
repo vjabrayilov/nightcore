@@ -133,8 +133,16 @@ void MachnetListener::Poll() {
         auto it = connections_.find(flow_id);
 
         if (it == connections_.end()) {
-            // New connection
-            auto new_conn = std::make_unique<MachnetConnection>(channel_, flow);
+            // New connection - reverse the flow for sending responses
+            // The received flow has src=remote, dst=local
+            // For sending, we need src=local, dst=remote
+            MachnetFlow_t reversed_flow;
+            reversed_flow.src_ip = flow.dst_ip;
+            reversed_flow.src_port = flow.dst_port;
+            reversed_flow.dst_ip = flow.src_ip;
+            reversed_flow.dst_port = flow.src_port;
+
+            auto new_conn = std::make_unique<MachnetConnection>(channel_, reversed_flow);
             conn = new_conn.get();
             connections_[flow_id] = conn;
 
