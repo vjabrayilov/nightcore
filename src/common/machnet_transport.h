@@ -92,8 +92,8 @@ private:
     uint16_t port_;
     NewConnectionCallback new_connection_callback_;
 
-    // Track active connections by flow
-    std::unordered_map<uint64_t, MachnetConnection*> connections_;
+    // Track active connections by flow (owns the connection objects)
+    std::unordered_map<uint64_t, std::unique_ptr<MachnetConnection>> connections_;
 
     friend class MachnetChannel;
     friend class MachnetConnection;

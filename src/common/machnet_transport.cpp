@@ -137,13 +137,13 @@ void MachnetListener::Poll() {
             // Use the flow AS-IS - Machnet handles bidirectional communication
             auto new_conn = std::make_unique<MachnetConnection>(channel_, flow);
             conn = new_conn.get();
-            connections_[flow_id] = conn;
+            connections_[flow_id] = std::move(new_conn);
 
             if (new_connection_callback_) {
                 new_connection_callback_(conn);
             }
         } else {
-            conn = it->second;
+            conn = it->second.get();
         }
 
         // Append data to connection's read buffer
