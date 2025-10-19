@@ -134,15 +134,8 @@ void MachnetListener::Poll() {
 
         if (it == connections_.end()) {
             // New connection from a remote peer
-            // The received flow has src=remote, dst=local
-            // For sending back, we need to swap src/dst so dst points to remote
-            MachnetFlow_t send_flow;
-            send_flow.src_ip = flow.dst_ip;      // local becomes source
-            send_flow.src_port = flow.dst_port;
-            send_flow.dst_ip = flow.src_ip;      // remote becomes destination
-            send_flow.dst_port = flow.src_port;
-
-            auto new_conn = std::make_unique<MachnetConnection>(channel_, send_flow);
+            // Use the flow AS-IS - Machnet handles bidirectional communication
+            auto new_conn = std::make_unique<MachnetConnection>(channel_, flow);
             conn = new_conn.get();
             connections_[flow_id] = conn;
 
@@ -184,6 +177,9 @@ MachnetConnection::~MachnetConnection() {
 bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
                                     std::span<const char> payload) {
     DCHECK_EQ(message.payload_size, gsl::narrow_cast<int32_t>(payload.size()));
+
+    LOG(INFO) << fmt::format("SendMessage: using flow {}:{} -> {}:{}, channel={:p}",
+                            flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port, channel_);
 
     // Send header
     int ret = machnet_send(channel_, flow_, &message, sizeof(protocol::GatewayMessage));
