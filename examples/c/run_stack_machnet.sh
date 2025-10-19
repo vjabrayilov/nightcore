@@ -81,9 +81,9 @@ if [ "$MODE" = "worker" ]; then
         exit 1
     fi
 
-    # Check if function library exists
-    if [ ! -f "$SCRIPT_DIR/libfoo.so" ]; then
-        echo -e "${YELLOW}Building function library...${NC}"
+    # Check if function libraries exist
+    if [ ! -f "$SCRIPT_DIR/libfoo.so" ] || [ ! -f "$SCRIPT_DIR/libbar.so" ]; then
+        echo -e "${YELLOW}Building function libraries...${NC}"
         cd "$SCRIPT_DIR"
         ./compile.sh
         cd "$BASE_DIR"
@@ -124,7 +124,7 @@ echo ""
 STEP=1
 TOTAL_STEPS=0
 [ "$MODE" = "gateway" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-[ "$MODE" = "worker" ] && TOTAL_STEPS=$((TOTAL_STEPS + 2))
+[ "$MODE" = "worker" ] && TOTAL_STEPS=$((TOTAL_STEPS + 3))  # Engine + 2 Launchers
 
 # Start Gateway with Machnet (gateway mode only)
 if [ "$MODE" = "gateway" ]; then
@@ -179,25 +179,48 @@ if [ "$MODE" = "worker" ]; then
     echo ""
     STEP=$((STEP + 1))
 
-    # Start Launcher
-    echo "[$STEP/$TOTAL_STEPS] Starting Launcher (func_id=1)..."
+    # Start Launcher for Foo (func_id=1)
+    echo "[$STEP/$TOTAL_STEPS] Starting Launcher for Foo (func_id=1)..."
     $BASE_DIR/bin/release/launcher \
         --func_id=1 \
         --fprocess_mode=cpp \
         --fprocess="$BASE_DIR/bin/release/func_worker_v1 $SCRIPT_DIR/libfoo.so" \
         --fprocess_output_dir="$LOG_DIR" &
 
-    LAUNCHER_PID=$!
+    LAUNCHER_FOO_PID=$!
     sleep 2
 
     # Check if Launcher started
-    if ! ps -p $LAUNCHER_PID > /dev/null; then
-        echo -e "${RED}Error: Launcher failed to start${NC}"
+    if ! ps -p $LAUNCHER_FOO_PID > /dev/null; then
+        echo -e "${RED}Error: Launcher for Foo failed to start${NC}"
         [ -n "$GATEWAY_PID" ] && kill $GATEWAY_PID 2>/dev/null || true
         [ -n "$ENGINE_PID" ] && kill $ENGINE_PID 2>/dev/null || true
         exit 1
     fi
-    echo "  ✓ Launcher started (PID: $LAUNCHER_PID)"
+    echo "  ✓ Launcher for Foo started (PID: $LAUNCHER_FOO_PID)"
+    echo ""
+    STEP=$((STEP + 1))
+
+    # Start Launcher for Bar (func_id=2)
+    echo "[$STEP/$TOTAL_STEPS] Starting Launcher for Bar (func_id=2)..."
+    $BASE_DIR/bin/release/launcher \
+        --func_id=2 \
+        --fprocess_mode=cpp \
+        --fprocess="$BASE_DIR/bin/release/func_worker_v1 $SCRIPT_DIR/libbar.so" \
+        --fprocess_output_dir="$LOG_DIR" &
+
+    LAUNCHER_BAR_PID=$!
+    sleep 2
+
+    # Check if Launcher started
+    if ! ps -p $LAUNCHER_BAR_PID > /dev/null; then
+        echo -e "${RED}Error: Launcher for Bar failed to start${NC}"
+        [ -n "$GATEWAY_PID" ] && kill $GATEWAY_PID 2>/dev/null || true
+        [ -n "$ENGINE_PID" ] && kill $ENGINE_PID 2>/dev/null || true
+        [ -n "$LAUNCHER_FOO_PID" ] && kill $LAUNCHER_FOO_PID 2>/dev/null || true
+        exit 1
+    fi
+    echo "  ✓ Launcher for Bar started (PID: $LAUNCHER_BAR_PID)"
     echo ""
 fi
 
@@ -220,14 +243,19 @@ if [ "$MODE" = "gateway" ]; then
     echo "  MODE=worker $0"
 
 elif [ "$MODE" = "worker" ]; then
-    echo "Engine:   Machnet connection ($ENGINE_MACHNET_IP -> $GATEWAY_MACHNET_IP:$MACHNET_PORT)"
-    echo "Launcher: func_id=1 (Foo), node_id=$NODE_ID"
+    echo "Engine:     Machnet connection ($ENGINE_MACHNET_IP -> $GATEWAY_MACHNET_IP:$MACHNET_PORT)"
+    echo "Launcher 1: func_id=1 (Foo), node_id=$NODE_ID"
+    echo "Launcher 2: func_id=2 (Bar), node_id=$NODE_ID"
     echo ""
     echo "PIDs:"
-    echo "  Engine:   $ENGINE_PID"
-    echo "  Launcher: $LAUNCHER_PID"
+    echo "  Engine:       $ENGINE_PID"
+    echo "  Launcher Foo: $LAUNCHER_FOO_PID"
+    echo "  Launcher Bar: $LAUNCHER_BAR_PID"
     echo ""
     echo -e "${YELLOW}Note: Worker node connected to Gateway at $GATEWAY_MACHNET_IP:$MACHNET_PORT${NC}"
+    echo ""
+    echo "Test the setup with:"
+    echo "  curl -X POST -d \"Hello\" http://$GATEWAY_MACHNET_IP:8080/function/Foo"
 fi
 
 echo ""
