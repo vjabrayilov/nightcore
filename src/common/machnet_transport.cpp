@@ -133,21 +133,38 @@ void MachnetListener::Poll() {
         auto it = connections_.find(flow_id);
 
         if (it == connections_.end()) {
-            // New connection - reverse the flow for sending responses
-            // The received flow has src=remote, dst=local
-            // For sending, we need src=local, dst=remote
-            MachnetFlow_t reversed_flow;
-            reversed_flow.src_ip = flow.dst_ip;
-            reversed_flow.src_port = flow.dst_port;
-            reversed_flow.dst_ip = flow.src_ip;
-            reversed_flow.dst_port = flow.src_port;
+            // New connection - create bidirectional connection to sender
+            // Convert IP addresses to string format for machnet_connect
+            char local_ip[32], remote_ip[32];
+            uint32_t local_ip_int = flow.dst_ip;
+            uint32_t remote_ip_int = flow.src_ip;
 
-            auto new_conn = std::make_unique<MachnetConnection>(channel_, reversed_flow);
-            conn = new_conn.get();
-            connections_[flow_id] = conn;
+            snprintf(local_ip, sizeof(local_ip), "%u.%u.%u.%u",
+                    (local_ip_int >> 24) & 0xFF,
+                    (local_ip_int >> 16) & 0xFF,
+                    (local_ip_int >> 8) & 0xFF,
+                    local_ip_int & 0xFF);
 
-            if (new_connection_callback_) {
-                new_connection_callback_(conn);
+            snprintf(remote_ip, sizeof(remote_ip), "%u.%u.%u.%u",
+                    (remote_ip_int >> 24) & 0xFF,
+                    (remote_ip_int >> 16) & 0xFF,
+                    (remote_ip_int >> 8) & 0xFF,
+                    remote_ip_int & 0xFF);
+
+            // Create proper Machnet connection for sending
+            MachnetFlow_t send_flow;
+            int connect_ret = machnet_connect(channel_, local_ip, remote_ip,
+                                             flow.src_port, &send_flow);
+            if (connect_ret != 0) {
+                LOG(ERROR) << "machnet_connect() failed for incoming connection: " << connect_ret;
+            } else {
+                auto new_conn = std::make_unique<MachnetConnection>(channel_, send_flow);
+                conn = new_conn.get();
+                connections_[flow_id] = conn;
+
+                if (new_connection_callback_) {
+                    new_connection_callback_(conn);
+                }
             }
         } else {
             conn = it->second;
