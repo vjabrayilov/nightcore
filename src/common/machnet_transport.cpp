@@ -178,8 +178,8 @@ void MachnetListener::Poll() {
 
 MachnetConnection::MachnetConnection(void* channel, const MachnetFlow_t& flow)
     : channel_(channel), flow_(flow) {
-    LOG(INFO) << fmt::format("Machnet connection created: {}:{} -> {}:{}",
-                            flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
+    LOG(INFO) << fmt::format("Machnet connection created: {}:{} -> {}:{} (channel={:p})",
+                            flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port, channel);
 }
 
 MachnetConnection::~MachnetConnection() {
@@ -216,20 +216,34 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
 void MachnetConnection::Poll() {
     constexpr size_t kBufferSize = 65536;
     static char buffer[kBufferSize];
+    static int poll_call_count = 0;
+    static int last_recv_count_logged = 0;
+
+    poll_call_count++;
+
+    // Log first few calls to confirm polling is happening
+    if (poll_call_count <= 3) {
+        LOG(INFO) << fmt::format("MachnetConnection::Poll() call #{}, channel={:p}, my flow={}:{} -> {}:{}",
+                                poll_call_count, channel_, flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port);
+    }
 
     MachnetFlow_t recv_flow;
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
 
     if (ret > 0) {
-        LOG(INFO) << fmt::format("Connection Poll received {} bytes from flow {}:{} -> {}:{}",
-                                ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port);
-        // Verify flow matches (optional, for safety)
+        LOG(INFO) << fmt::format("Connection Poll received {} bytes from flow {}:{} -> {}:{} (channel={:p})",
+                                ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port, channel_);
         read_buffer_.AppendData(buffer, ret);
         ProcessMessages();
     } else if (ret == 0) {
-        // No data available
+        // No data available - log occasionally to confirm polling is happening
+        if (poll_call_count - last_recv_count_logged >= 1000) {
+            LOG(INFO) << fmt::format("Connection Poll: machnet_recv returned 0 (no data), called {} times total, channel={:p}",
+                                    poll_call_count, channel_);
+            last_recv_count_logged = poll_call_count;
+        }
     } else {
-        LOG(ERROR) << "machnet_recv() failed with error: " << ret;
+        LOG(ERROR) << fmt::format("machnet_recv() failed with error: {}, channel={:p}", ret, channel_);
     }
 }
 

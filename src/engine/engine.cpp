@@ -624,15 +624,24 @@ machnet::MachnetConnection* Engine::PickMachnetGatewayConnection() {
 void Engine::MachnetPollCallback(uv_prepare_t* handle) {
     Engine* engine = reinterpret_cast<Engine*>(handle->data);
     static int poll_count = 0;
-    if (++poll_count % 1000 == 0) {
-        HLOG(INFO) << fmt::format("Engine MachnetPollCallback called {} times, {} connections",
-                                  poll_count, engine->machnet_connections_.size());
+    poll_count++;
+
+    // Log immediately on first call, then every 100 calls
+    if (poll_count == 1) {
+        HLOG(INFO) << fmt::format("Engine MachnetPollCallback: FIRST CALL with {} connections",
+                                  engine->machnet_connections_.size());
+    } else if (poll_count % 100 == 0) {
+        HLOG(INFO) << fmt::format("Engine MachnetPollCallback called {} times", poll_count);
     }
-    // Poll Engine's connections to Gateway
-    for (auto& conn : engine->machnet_connections_) {
-        conn->Poll();
+
+    // IMPORTANT: On Engine side, all connections share the same channel.
+    // We should poll the channel ONCE and route messages to the appropriate connection.
+    // Currently we just poll all connections since they're all waiting for responses from Gateway.
+    // Each connection will call machnet_recv(), but only the first non-empty one will succeed.
+    for (size_t i = 0; i < engine->machnet_connections_.size(); i++) {
+        engine->machnet_connections_[i]->Poll();
     }
-    // Also poll the channel (for listeners if any)
+    // Also poll the channel's listeners (if any - Gateway has listeners, Engine doesn't)
     machnet::MachnetChannel::Get()->Poll();
 }
 
