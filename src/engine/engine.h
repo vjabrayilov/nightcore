@@ -86,6 +86,7 @@ private:
     std::string gateway_machnet_ip_;
     std::vector<std::unique_ptr<machnet::MachnetConnection>> machnet_connections_;
     uv_prepare_t machnet_poll_prepare_;
+    uv_timer_t machnet_poll_timer_;  // Backup timer-based polling
     std::atomic<size_t> next_machnet_conn_idx_;
 
     uv_stream_t* uv_handle_;
@@ -140,6 +141,8 @@ private:
                                       std::span<const char> payload);
     machnet::MachnetConnection* PickMachnetGatewayConnection();
     static void MachnetPollCallback(uv_prepare_t* handle);
+    static void MachnetTimerCallback(uv_timer_t* handle);
+    void DoMachnetPoll();  // Actual polling logic
 
     DECLARE_UV_CONNECT_CB_FOR_CLASS(GatewayConnect);
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(MessageConnection);

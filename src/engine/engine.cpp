@@ -125,10 +125,18 @@ void Engine::StartInternal() {
             machnet_connections_.push_back(std::move(conn));
         }
 
-        // Setup polling callback
+        // Setup polling callback (uv_prepare - runs before each I/O poll)
         UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
         machnet_poll_prepare_.data = this;
         UV_CHECK_OK(uv_prepare_start(&machnet_poll_prepare_, &Engine::MachnetPollCallback));
+        HLOG(INFO) << "Started Machnet prepare polling callback";
+
+        // Setup backup timer-based polling (every 1ms) to ensure polling never stops
+        UV_CHECK_OK(uv_timer_init(uv_loop(), &machnet_poll_timer_));
+        machnet_poll_timer_.data = this;
+        UV_CHECK_OK(uv_timer_start(&machnet_poll_timer_, &Engine::MachnetTimerCallback,
+                                   1, 1));  // Start after 1ms, repeat every 1ms
+        HLOG(INFO) << "Started Machnet timer polling callback (1ms interval)";
 
         HLOG(INFO) << fmt::format("Created {} Machnet connections to Gateway at {}:{}",
                                   total_gateway_conn, gateway_machnet_ip_, gateway_port_);
@@ -621,28 +629,77 @@ machnet::MachnetConnection* Engine::PickMachnetGatewayConnection() {
     return machnet_connections_[idx].get();
 }
 
-void Engine::MachnetPollCallback(uv_prepare_t* handle) {
-    Engine* engine = reinterpret_cast<Engine*>(handle->data);
+void Engine::DoMachnetPoll() {
     static int poll_count = 0;
+    static int64_t last_poll_timestamp = 0;
     poll_count++;
 
-    // Log immediately on first call, then every 100 calls
-    if (poll_count == 1) {
-        HLOG(INFO) << fmt::format("Engine MachnetPollCallback: FIRST CALL with {} connections",
-                                  engine->machnet_connections_.size());
+    int64_t now = GetMonotonicMicroTimestamp();
+    if (last_poll_timestamp > 0) {
+        int64_t gap = now - last_poll_timestamp;
+        if (gap > 100000) {  // 100ms gap - warn if polling is too slow
+            LOG(WARNING) << fmt::format("Engine DoMachnetPoll: Large gap detected! {} us since last poll", gap);
+        }
+    }
+    last_poll_timestamp = now;
+
+    // Log immediately on first few calls
+    if (poll_count <= 10) {
+        HLOG(INFO) << fmt::format("Engine DoMachnetPoll: Call #{} with {} connections",
+                                  poll_count, machnet_connections_.size());
     } else if (poll_count % 100 == 0) {
-        HLOG(INFO) << fmt::format("Engine MachnetPollCallback called {} times", poll_count);
+        HLOG(INFO) << fmt::format("Engine DoMachnetPoll called {} times", poll_count);
     }
 
-    // IMPORTANT: On Engine side, all connections share the same channel.
-    // We should poll the channel ONCE and route messages to the appropriate connection.
-    // Currently we just poll all connections since they're all waiting for responses from Gateway.
-    // Each connection will call machnet_recv(), but only the first non-empty one will succeed.
-    for (size_t i = 0; i < engine->machnet_connections_.size(); i++) {
-        engine->machnet_connections_[i]->Poll();
+    // Wrap in try-catch to ensure polling never crashes
+    try {
+        // IMPORTANT: On Engine side, all connections share the same channel.
+        // We should poll the channel ONCE and route messages to the appropriate connection.
+        // Currently we just poll all connections since they're all waiting for responses from Gateway.
+        // Each connection will call machnet_recv(), but only the first non-empty one will succeed.
+        for (size_t i = 0; i < machnet_connections_.size(); i++) {
+            if (machnet_connections_[i] != nullptr) {
+                machnet_connections_[i]->Poll();
+            } else {
+                LOG(WARNING) << fmt::format("Engine DoMachnetPoll: Connection {} is null!", i);
+            }
+        }
+        // Also poll the channel's listeners (if any - Gateway has listeners, Engine doesn't)
+        machnet::MachnetChannel::Get()->Poll();
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Engine DoMachnetPoll: Exception caught: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "Engine DoMachnetPoll: Unknown exception caught!";
     }
-    // Also poll the channel's listeners (if any - Gateway has listeners, Engine doesn't)
-    machnet::MachnetChannel::Get()->Poll();
+}
+
+void Engine::MachnetPollCallback(uv_prepare_t* handle) {
+    // Verify handle data is valid
+    if (handle == nullptr || handle->data == nullptr) {
+        LOG(ERROR) << "Engine MachnetPollCallback: Invalid handle or data pointer!";
+        return;
+    }
+
+    Engine* engine = reinterpret_cast<Engine*>(handle->data);
+    engine->DoMachnetPoll();
+}
+
+void Engine::MachnetTimerCallback(uv_timer_t* handle) {
+    static int timer_call_count = 0;
+    timer_call_count++;
+
+    if (timer_call_count <= 5) {
+        LOG(INFO) << fmt::format("Engine MachnetTimerCallback: Call #{}", timer_call_count);
+    }
+
+    // Verify handle data is valid
+    if (handle == nullptr || handle->data == nullptr) {
+        LOG(ERROR) << "Engine MachnetTimerCallback: Invalid handle or data pointer!";
+        return;
+    }
+
+    Engine* engine = reinterpret_cast<Engine*>(handle->data);
+    engine->DoMachnetPoll();
 }
 
 }  // namespace engine
