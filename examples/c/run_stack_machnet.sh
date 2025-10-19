@@ -7,16 +7,17 @@
 #   MODE=gateway ./run_stack_machnet.sh    # Run gateway only
 #   MODE=worker ./run_stack_machnet.sh     # Run engine + launcher
 
-BASE_DIR=$(pwd)
+BASE_DIR=$(pwd)/../../
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+LOG_DIR="$SCRIPT_DIR/logs"
 
 # Deployment mode: "gateway" or "worker"
 MODE="${MODE:-gateway}"
 
 # Machnet configuration
 # IMPORTANT: Update these IPs to match your Machnet-enabled NICs
-GATEWAY_MACHNET_IP="${GATEWAY_MACHNET_IP:-10.0.1.10}"
-ENGINE_MACHNET_IP="${ENGINE_MACHNET_IP:-10.0.1.11}"
+GATEWAY_MACHNET_IP="${GATEWAY_MACHNET_IP:-10.10.1.1}"
+ENGINE_MACHNET_IP="${ENGINE_MACHNET_IP:-10.10.1.2}"
 MACHNET_PORT=10007
 
 # Standard configuration
@@ -63,6 +64,7 @@ fi
 # Check if binaries exist (based on mode)
 if [ "$MODE" = "gateway" ]; then
     if [ ! -f "$BASE_DIR/bin/release/gateway" ]; then
+        echo "$BASE_DIR/bin/release/gateway"
         echo -e "${RED}Error: Gateway binary not found${NC}"
         echo "Please build the project first:"
         echo "  make -j \$(nproc)"
@@ -112,16 +114,20 @@ cleanup() {
 
 trap cleanup INT TERM
 
+# Create log directory
+mkdir -p "$LOG_DIR"
+
 echo -e "${GREEN}Starting Nightcore with Machnet (mode: $MODE)...${NC}"
+echo "Log output directory: $LOG_DIR"
 echo ""
 
 STEP=1
 TOTAL_STEPS=0
-[ "$MODE" = "gateway" ] || [ "$MODE" = "all" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
-[ "$MODE" = "worker" ] || [ "$MODE" = "all" ] && TOTAL_STEPS=$((TOTAL_STEPS + 2))
+[ "$MODE" = "gateway" ] && TOTAL_STEPS=$((TOTAL_STEPS + 1))
+[ "$MODE" = "worker" ] && TOTAL_STEPS=$((TOTAL_STEPS + 2))
 
-# Start Gateway with Machnet (gateway or all mode)
-if [ "$MODE" = "gateway" ] || [ "$MODE" = "all" ]; then
+# Start Gateway with Machnet (gateway mode only)
+if [ "$MODE" = "gateway" ]; then
     echo "[$STEP/$TOTAL_STEPS] Starting Gateway (Machnet: $GATEWAY_MACHNET_IP:$MACHNET_PORT)..."
     $BASE_DIR/bin/release/gateway \
         --func_config_file="$FUNC_CONFIG" \
@@ -146,8 +152,8 @@ if [ "$MODE" = "gateway" ] || [ "$MODE" = "all" ]; then
     STEP=$((STEP + 1))
 fi
 
-# Start Engine with Machnet (worker or all mode)
-if [ "$MODE" = "worker" ] || [ "$MODE" = "all" ]; then
+# Start Engine with Machnet (worker mode only)
+if [ "$MODE" = "worker" ]; then
     echo "[$STEP/$TOTAL_STEPS] Starting Engine (Machnet: $ENGINE_MACHNET_IP -> $GATEWAY_MACHNET_IP:$MACHNET_PORT)..."
     $BASE_DIR/bin/release/engine \
         --func_config_file="$FUNC_CONFIG" \
@@ -179,7 +185,7 @@ if [ "$MODE" = "worker" ] || [ "$MODE" = "all" ]; then
         --func_id=1 \
         --fprocess_mode=cpp \
         --fprocess="$BASE_DIR/bin/release/func_worker_v1 $SCRIPT_DIR/libfoo.so" \
-        --fprocess_output_dir=/tmp/nightcore_output &
+        --fprocess_output_dir="$LOG_DIR" &
 
     LAUNCHER_PID=$!
     sleep 2
@@ -222,38 +228,6 @@ elif [ "$MODE" = "worker" ]; then
     echo "  Launcher: $LAUNCHER_PID"
     echo ""
     echo -e "${YELLOW}Note: Worker node connected to Gateway at $GATEWAY_MACHNET_IP:$MACHNET_PORT${NC}"
-
-elif [ "$MODE" = "all" ]; then
-    echo "Gateway:  http://localhost:$HTTP_PORT (Machnet: $GATEWAY_MACHNET_IP:$MACHNET_PORT)"
-    echo "Engine:   Machnet connection ($ENGINE_MACHNET_IP -> $GATEWAY_MACHNET_IP:$MACHNET_PORT)"
-    echo "Launcher: func_id=1 (Foo)"
-    echo ""
-    echo "PIDs:"
-    echo "  Gateway:  $GATEWAY_PID"
-    echo "  Engine:   $ENGINE_PID"
-    echo "  Launcher: $LAUNCHER_PID"
-    echo ""
-
-    # Test function call (only in all mode)
-    echo -e "${GREEN}Testing function invocation...${NC}"
-    sleep 2
-
-    TEST_INPUT="World"
-    echo "Invoking Foo with input: \"$TEST_INPUT\""
-    RESPONSE=$(curl -s -X POST -d "$TEST_INPUT" http://localhost:$HTTP_PORT/function/Foo)
-
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}✓ Response: $RESPONSE${NC}"
-        echo ""
-        echo "Machnet integration is working!"
-    else
-        echo -e "${RED}✗ Request failed${NC}"
-    fi
-
-    echo ""
-    echo "Additional test commands:"
-    echo "  curl -X POST -d 'Hello' http://localhost:$HTTP_PORT/function/Foo"
-    echo "  curl -X POST -d 'Test' http://localhost:$HTTP_PORT/function/Bar"
 fi
 
 echo ""
