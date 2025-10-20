@@ -148,7 +148,7 @@ void IOWorker::OnConnectionClose(ConnectionBase* connection) {
         if (connections_for_pick_.contains(connection->type())) {
             connections_for_pick_.erase(connection->type());
         }
-        HLOG(INFO) << fmt::format("One connection of type {0} closed, total of type {0} is {1}",
+        VLOG(1) << fmt::format("One connection of type {0} closed, total of type {0} is {1}",
                                   connection->type(),
                                   connections_by_type_[connection->type()].size());
     }
@@ -210,7 +210,7 @@ UV_READ_CB_FOR_CLASS(IOWorker, NewConnection) {
         if (connections_for_pick_.contains(connection->type())) {
             connections_for_pick_[connection->type()].push_back(connection);
         }
-        HLOG(INFO) << fmt::format("New connection of type {0}, total of type {0} is {1}",
+        VLOG(1) << fmt::format("New connection of type {0}, total of type {0} is {1}",
                                   connection->type(),
                                   connections_by_type_[connection->type()].size());
     }
