@@ -221,7 +221,7 @@ void MachnetConnection::Poll() {
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
 
     if (ret > 0) {
-        LOG(INFO) << fmt::format("Machnet received {} bytes from flow {}:{} -> {}:{}",
+        VLOG(1) << fmt::format("Machnet received {} bytes from flow {}:{} -> {}:{}",
                                 ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port);
         read_buffer_.AppendData(buffer, ret);
         ProcessMessages();
