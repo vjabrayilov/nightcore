@@ -125,7 +125,7 @@ void MachnetListener::Poll() {
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
 
     if (ret > 0) {
-        LOG(INFO) << fmt::format("Listener received {} bytes from flow {}:{} -> {}:{}",
+        VLOG(1) << fmt::format("Listener received {} bytes from flow {}:{} -> {}:{}",
                                 ret, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
         // New message received
         uint64_t flow_id = ((uint64_t)flow.src_ip << 32) |
@@ -191,7 +191,7 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
                                     std::span<const char> payload) {
     DCHECK_EQ(message.payload_size, gsl::narrow_cast<int32_t>(payload.size()));
 
-    LOG(INFO) << fmt::format("SendMessage: using flow {}:{} -> {}:{}, channel={:p}",
+    VLOG(1) << fmt::format("SendMessage: using flow {}:{} -> {}:{}, channel={:p}",
                             flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port, channel_);
 
     // Send header
@@ -246,7 +246,7 @@ void MachnetConnection::ProcessMessages() {
                 read_buffer_.data() + sizeof(protocol::GatewayMessage),
                 full_size - sizeof(protocol::GatewayMessage));
 
-            LOG(INFO) << fmt::format("Machnet message complete: header + {} bytes payload", payload.size());
+            VLOG(1) << fmt::format("Machnet message complete: header + {} bytes payload", payload.size());
             if (message_callback_) {
                 message_callback_(*message, payload);
             } else {

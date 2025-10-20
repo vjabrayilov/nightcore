@@ -297,7 +297,7 @@ void Engine::OnRecvMessage(MessageConnection* connection, const Message& message
                     func_call, parent_func_call,
                     /* input_size= */ gsl::narrow_cast<size_t>(-message.payload_size),
                     std::span<const char>(), /* shm_input= */ true);
-                
+
             } else {
                 success = dispatcher->OnNewFuncCall(
                     func_call, parent_func_call,
@@ -369,13 +369,13 @@ void Engine::OnRecvMessage(MessageConnection* connection, const Message& message
 }
 
 void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char> input) {
-    HLOG(INFO) << fmt::format("OnExternalFuncCall: func_id={}, input={} bytes",
+    VLOG(1) << fmt::format("OnExternalFuncCall: func_id={}, input={} bytes",
                               func_call.func_id, input.size());
 
     inflight_external_requests_.fetch_add(1);
     std::unique_ptr<ipc::ShmRegion> input_region = nullptr;
     if (input.size() > MESSAGE_INLINE_DATA_SIZE) {
-        HLOG(INFO) << "Creating shared memory for large input";
+        VLOG(1) << "Creating shared memory for large input";
         input_region = ipc::ShmCreate(
             ipc::GetFuncCallInputShmName(func_call.full_call_id), input.size());
         if (input_region == nullptr) {
@@ -417,7 +417,7 @@ void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char>
         return;
     }
 
-    HLOG(INFO) << fmt::format("Dispatching to Dispatcher[{}], input_size={}, use_shm={}",
+    VLOG(1) << fmt::format("Dispatching to Dispatcher[{}], input_size={}, use_shm={}",
                               func_call.func_id, input.size(), input.size() > MESSAGE_INLINE_DATA_SIZE);
 
     bool success = false;
@@ -439,7 +439,7 @@ void Engine::OnExternalFuncCall(const FuncCall& func_call, std::span<const char>
         }
         ExternalFuncCallFailed(func_call);
     } else {
-        HLOG(INFO) << fmt::format("Dispatcher[{}] successfully accepted func_call", func_call.func_id);
+        VLOG(1) << fmt::format("Dispatcher[{}] successfully accepted func_call", func_call.func_id);
     }
 }
 
@@ -626,7 +626,7 @@ void Engine::OnRecvMachnetGatewayMessage(const GatewayMessage& message,
     // Only dispatch messages are expected from Gateway
     if (protocol::IsDispatchFuncCallMessage(message)) {
         FuncCall func_call = GetFuncCallFromMessage(message);
-        HLOG(INFO) << fmt::format("Machnet dispatch: func_id={}, call_id={:#x}, payload={} bytes",
+        VLOG(1) << fmt::format("Machnet dispatch: func_id={}, call_id={:#x}, payload={} bytes",
                                   static_cast<uint16_t>(func_call.func_id),
                                   func_call.full_call_id, payload.size());
         OnExternalFuncCall(func_call, payload);
