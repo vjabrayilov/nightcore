@@ -18,6 +18,10 @@
 ABSL_FLAG(std::string, listen_addr, "0.0.0.0",
           "Address to listen for engine connections");
 ABSL_FLAG(int, listen_port, 10007, "Port for engine connections");
+ABSL_FLAG(bool, use_machnet, false,
+          "Use Machnet instead of TCP for engine connections");
+ABSL_FLAG(std::string, machnet_ip, "",
+          "Machnet IP address (required if use_machnet=true)");
 ABSL_FLAG(int, func_id, 1, "Function ID to invoke");
 ABSL_FLAG(int, method_id, 0, "Method ID (for gRPC, 0 for HTTP)");
 ABSL_FLAG(int, duration_sec, 30, "Duration of stress test in seconds");
@@ -399,8 +403,8 @@ private:
 class StressClient : public server::ServerBase {
 public:
   StressClient()
-      : listen_backlog_(64), should_stop_(false), test_started_(false),
-        start_time_(0), end_time_(0), next_call_id_(1) {}
+      : listen_backlog_(64), use_machnet_(false), should_stop_(false),
+        test_started_(false), start_time_(0), end_time_(0), next_call_id_(1) {}
 
   ~StressClient() {}
 
@@ -408,6 +412,8 @@ public:
     listen_addr_ = std::string(addr);
   }
   void set_listen_port(int port) { listen_port_ = port; }
+  void set_use_machnet(bool value) { use_machnet_ = value; }
+  void set_machnet_ip(std::string_view ip) { machnet_ip_ = std::string(ip); }
 
   uint32_t NextCallId() {
     return next_call_id_.fetch_add(1, std::memory_order_relaxed);
@@ -534,6 +540,8 @@ private:
   std::string listen_addr_;
   int listen_port_;
   int listen_backlog_;
+  bool use_machnet_;
+  std::string machnet_ip_;
   uv_tcp_t listen_handle_;
 
   // Test parameters (set when test starts)
@@ -750,11 +758,20 @@ int main(int argc, char *argv[]) {
   auto client = std::make_unique<faas::stress::StressClient>();
   client->set_listen_addr(absl::GetFlag(FLAGS_listen_addr));
   client->set_listen_port(absl::GetFlag(FLAGS_listen_port));
+  client->set_use_machnet(absl::GetFlag(FLAGS_use_machnet));
+  client->set_machnet_ip(absl::GetFlag(FLAGS_machnet_ip));
 
   g_stress_client.store(client.get());
 
-  LOG(INFO) << "Listening on " << absl::GetFlag(FLAGS_listen_addr) << ":"
-            << absl::GetFlag(FLAGS_listen_port) << " for Engine connections";
+  if (absl::GetFlag(FLAGS_use_machnet)) {
+    LOG(INFO) << "Listening on Machnet " << absl::GetFlag(FLAGS_machnet_ip)
+              << ":" << absl::GetFlag(FLAGS_listen_port)
+              << " for Engine connections";
+  } else {
+    LOG(INFO) << "Listening on " << absl::GetFlag(FLAGS_listen_addr) << ":"
+              << absl::GetFlag(FLAGS_listen_port)
+              << " for Engine connections";
+  }
 
   client->Start();
 
