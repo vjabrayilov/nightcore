@@ -818,11 +818,12 @@ private:
     int64_t pacing_window_start_us = start_time_;
     uint32_t sent_in_window = 0;
 
-    // Test phase
+    // Test phase with periodic reporting
     int64_t test_end_time = start_time_ + duration_sec * 1000000LL;
     int64_t next_report_time = start_time_ + report_interval * 1000000LL;
 
-    while (GetMonotonicMicroTimestamp() < test_end_time && !should_stop_.load()) {
+    while (GetMonotonicMicroTimestamp() < test_end_time &&
+           !should_stop_.load()) {
       int64_t now = GetMonotonicMicroTimestamp();
 
       // Reset pacing window every second
@@ -831,16 +832,18 @@ private:
         sent_in_window = 0;
       }
 
-      // Calculate how many requests we can send
+      // Calculate how many requests we can send this iteration
       size_t to_send = 0;
       if (target_rps_ <= 0) {
-        to_send = inflight_limit_; // unlimited - just respect inflight limit
+        // Unlimited mode - send in bursts
+        to_send = 100;  // Burst size
       } else if (sent_in_window < static_cast<uint32_t>(target_rps_)) {
-        to_send = std::min(static_cast<size_t>(target_rps_ - sent_in_window),
-                          static_cast<size_t>(inflight_limit_));
+        // Respect RPS limit
+        to_send = std::min<size_t>(
+            target_rps_ - sent_in_window, 100);  // Max burst of 100
       }
 
-      // Send requests via Machnet
+      // Send requests directly (like Engine does at engine.cpp:123)
       for (size_t i = 0; i < to_send; i++) {
         SendMachnetRequest(now);
         sent_in_window++;
@@ -850,14 +853,18 @@ private:
       if (now >= next_report_time) {
         int elapsed_sec = (now - start_time_) / 1000000;
         PrintMachnetProgress(elapsed_sec);
-        next_report_time = start_time_ + (elapsed_sec + report_interval) * 1000000LL;
+        next_report_time =
+            start_time_ + (elapsed_sec + report_interval) * 1000000LL;
       }
 
-      // Small sleep to avoid busy loop
+      // Small sleep to avoid busy loop - event loop handles receiving
       std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 
     end_time_ = GetMonotonicMicroTimestamp();
+
+    // Wait a bit for inflight requests to complete
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Print final results
     LOG(INFO) << "";
