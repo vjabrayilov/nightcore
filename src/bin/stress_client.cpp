@@ -449,9 +449,20 @@ public:
     LOG(INFO) << "";
     LOG(INFO) << "========================================";
 
-    // Wait for at least one engine connection
+    // Wait for at least one engine connection (TCP or Machnet)
     LOG(INFO) << "Waiting for Engine to connect...";
-    while (connections_.empty() && !should_stop_.load()) {
+    while (true) {
+      bool has_connections = false;
+      if (use_machnet_) {
+        std::lock_guard<std::mutex> lk(machnet_connections_mu_);
+        has_connections = !machnet_connections_.empty();
+      } else {
+        has_connections = !connections_.empty();
+      }
+
+      if (has_connections || should_stop_.load()) {
+        break;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
@@ -460,8 +471,12 @@ public:
       return;
     }
 
-    LOG(INFO) << "Engine connected with " << connections_.size()
-              << " connection(s)";
+    size_t num_connections = use_machnet_
+        ? ([&]() { std::lock_guard<std::mutex> lk(machnet_connections_mu_); return machnet_connections_.size(); })()
+        : connections_.size();
+
+    LOG(INFO) << "Engine connected with " << num_connections
+              << " connection(s) via " << (use_machnet_ ? "Machnet" : "TCP");
     LOG(INFO) << "Global target RPS: "
               << (target_rps == 0 ? "unlimited" : std::to_string(target_rps));
     LOG(INFO) << "";
@@ -470,7 +485,13 @@ public:
     LOG(INFO) << "Waiting 3 seconds for workers to initialize...";
     std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    // Distribute global target RPS across connections and enable sending
+    if (use_machnet_) {
+      // Machnet mode - run test from main thread
+      RunMachnetStressTest(warmup_sec, duration_sec, report_interval);
+      return;
+    }
+
+    // TCP mode - distribute global target RPS across connections and enable sending
     if (!connections_.empty()) {
       if (target_rps_ <= 0) {
         for (auto &conn : connections_) {
@@ -549,6 +570,13 @@ private:
   std::unique_ptr<machnet::MachnetListener> machnet_listener_;
   uv_prepare_t machnet_poll_prepare_;
   uv_timer_t machnet_poll_timer_;
+  std::vector<machnet::MachnetConnection *> machnet_connections_;
+  std::mutex machnet_connections_mu_;
+
+  // Machnet stress test state
+  ConnectionStats machnet_stats_;
+  std::mutex machnet_stats_mu_;
+  std::atomic<bool> machnet_warmup_done_{false};
 
   // Test parameters (set when test starts)
   int func_id_;
@@ -773,6 +801,175 @@ private:
     LOG(INFO) << "========================================";
   }
 
+  void RunMachnetStressTest(int warmup_sec, int duration_sec,
+                             int report_interval) {
+    // Warmup phase
+    if (warmup_sec > 0) {
+      LOG(INFO) << "Warmup phase: " << warmup_sec << " seconds...";
+      std::this_thread::sleep_for(std::chrono::seconds(warmup_sec));
+      machnet_warmup_done_.store(true);
+      LOG(INFO) << "Warmup complete. Starting measurement...";
+      LOG(INFO) << "";
+    } else {
+      machnet_warmup_done_.store(true);
+    }
+
+    start_time_ = GetMonotonicMicroTimestamp();
+    int64_t pacing_window_start_us = start_time_;
+    uint32_t sent_in_window = 0;
+
+    // Test phase
+    int64_t test_end_time = start_time_ + duration_sec * 1000000LL;
+    int64_t next_report_time = start_time_ + report_interval * 1000000LL;
+
+    while (GetMonotonicMicroTimestamp() < test_end_time && !should_stop_.load()) {
+      int64_t now = GetMonotonicMicroTimestamp();
+
+      // Reset pacing window every second
+      if (now - pacing_window_start_us >= 1000000) {
+        pacing_window_start_us = now;
+        sent_in_window = 0;
+      }
+
+      // Calculate how many requests we can send
+      size_t to_send = 0;
+      if (target_rps_ <= 0) {
+        to_send = inflight_limit_; // unlimited - just respect inflight limit
+      } else if (sent_in_window < static_cast<uint32_t>(target_rps_)) {
+        to_send = std::min(static_cast<size_t>(target_rps_ - sent_in_window),
+                          static_cast<size_t>(inflight_limit_));
+      }
+
+      // Send requests via Machnet
+      for (size_t i = 0; i < to_send; i++) {
+        SendMachnetRequest(now);
+        sent_in_window++;
+      }
+
+      // Periodic reporting
+      if (now >= next_report_time) {
+        int elapsed_sec = (now - start_time_) / 1000000;
+        PrintMachnetProgress(elapsed_sec);
+        next_report_time = start_time_ + (elapsed_sec + report_interval) * 1000000LL;
+      }
+
+      // Small sleep to avoid busy loop
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    end_time_ = GetMonotonicMicroTimestamp();
+
+    // Print final results
+    LOG(INFO) << "";
+    PrintMachnetFinalResults();
+  }
+
+  void SendMachnetRequest(int64_t send_time) {
+    std::lock_guard<std::mutex> lk(machnet_connections_mu_);
+    if (machnet_connections_.empty()) {
+      return;
+    }
+
+    // Round-robin across connections
+    static size_t next_conn = 0;
+    machnet::MachnetConnection *conn =
+        machnet_connections_[next_conn % machnet_connections_.size()];
+    next_conn++;
+
+    // Create function call
+    uint16_t client_id = 0;
+    uint32_t call_id = next_call_id_.fetch_add(1, std::memory_order_relaxed);
+    FuncCall func_call = NewFuncCall(func_id_, client_id, call_id);
+    if (method_id_ > 0) {
+      func_call.method_id = method_id_;
+    }
+
+    // Build message
+    GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
+    message.payload_size = input_size_;
+
+    // Send via Machnet
+    std::string input_buffer(input_size_, 'x');
+    bool success =
+        conn->SendMessage(message, std::span<const char>(input_buffer.data(), input_size_));
+
+    if (success) {
+      // Track stats - for Machnet we don't have per-connection tracking,
+      // so we use a single global EngineConnection for stats
+      // We'll track inflight globally
+      static std::unique_ptr<EngineConnection> stats_tracker;
+      if (!stats_tracker) {
+        stats_tracker = std::make_unique<EngineConnection>(
+            &next_call_id_, 0, 0, func_id_, method_id_, input_size_,
+            target_rps_, inflight_limit_);
+      }
+
+      RegisterInflight(func_call.full_call_id, stats_tracker.get(), send_time, 0);
+
+      std::lock_guard<std::mutex> stats_lk(machnet_stats_mu_);
+      machnet_stats_.sent_count++;
+    }
+  }
+
+  void PrintMachnetProgress(int elapsed_sec) {
+    std::lock_guard<std::mutex> lk(machnet_stats_mu_);
+    LOG(INFO) << fmt::format(
+        "[T+{}s] Sent: {} | Completed: {} | Failed: {} | Latencies: {}",
+        elapsed_sec, machnet_stats_.sent_count, machnet_stats_.completed_count,
+        machnet_stats_.failed_count, machnet_stats_.latencies_us.size());
+  }
+
+  void PrintMachnetFinalResults() {
+    std::lock_guard<std::mutex> lk(machnet_connections_mu_);
+    std::lock_guard<std::mutex> stats_lk(machnet_stats_mu_);
+
+    double duration_sec = (end_time_ - start_time_) / 1e6;
+    double throughput = machnet_stats_.completed_count / duration_sec;
+
+    LOG(INFO) << "========================================";
+    LOG(INFO) << "=== Stress Test Results ===";
+    LOG(INFO) << "========================================";
+    LOG(INFO) << fmt::format("Connections:       {}", machnet_connections_.size());
+    LOG(INFO) << fmt::format("Duration:          {:.2f} seconds", duration_sec);
+    LOG(INFO) << fmt::format("Total Sent:        {}", machnet_stats_.sent_count);
+    LOG(INFO) << fmt::format(
+        "Total Completed:   {} ({:.2f}%)", machnet_stats_.completed_count,
+        100.0 * machnet_stats_.completed_count /
+            std::max<uint64_t>(1, machnet_stats_.sent_count));
+    LOG(INFO) << fmt::format(
+        "Total Failed:      {} ({:.2f}%)", machnet_stats_.failed_count,
+        100.0 * machnet_stats_.failed_count /
+            std::max<uint64_t>(1, machnet_stats_.sent_count));
+    LOG(INFO) << "";
+    LOG(INFO) << fmt::format("Throughput:        {:.1f} rps", throughput);
+    LOG(INFO) << "";
+
+    if (!machnet_stats_.latencies_us.empty()) {
+      std::sort(machnet_stats_.latencies_us.begin(),
+               machnet_stats_.latencies_us.end());
+
+      size_t n = machnet_stats_.latencies_us.size();
+      int64_t min_lat = machnet_stats_.latencies_us[0];
+      int64_t p50_lat = machnet_stats_.latencies_us[n * 50 / 100];
+      int64_t p90_lat = machnet_stats_.latencies_us[n * 90 / 100];
+      int64_t p99_lat = machnet_stats_.latencies_us[n * 99 / 100];
+      int64_t p999_lat = machnet_stats_.latencies_us[n * 999 / 1000];
+      int64_t max_lat = machnet_stats_.latencies_us[n - 1];
+
+      LOG(INFO) << "Latency (us):";
+      LOG(INFO) << fmt::format("  Min:    {}", min_lat);
+      LOG(INFO) << fmt::format("  p50:    {}", p50_lat);
+      LOG(INFO) << fmt::format("  p90:    {}", p90_lat);
+      LOG(INFO) << fmt::format("  p99:    {}", p99_lat);
+      LOG(INFO) << fmt::format("  p99.9:  {}", p999_lat);
+      LOG(INFO) << fmt::format("  Max:    {}", max_lat);
+    } else {
+      LOG(INFO) << "No latency data collected";
+    }
+
+    LOG(INFO) << "========================================";
+  }
+
   ConnectionStats MergeStats() {
     ConnectionStats merged;
     for (const auto &conn : connections_) {
@@ -797,17 +994,46 @@ private:
                            std::span<const char> payload) {
           OnRecvMachnetEngineMessage(connection, msg, payload);
         });
-
-    // For stress_client, we don't need handshake - Engine connects to us
-    // We'll just track this connection for sending requests
-    // TODO: Actually use Machnet connections for sending in the stress test
   }
 
   void OnRecvMachnetEngineMessage(machnet::MachnetConnection *connection,
                                    const GatewayMessage &message,
                                    std::span<const char> payload) {
-    // For now, just log - in full implementation would handle responses
-    LOG(INFO) << "Received Machnet message from Engine";
+    // Handle handshake - just track the connection
+    if (IsEngineHandshakeMessage(message)) {
+      LOG(INFO) << "Machnet Engine handshake received from node_id="
+                << message.node_id;
+      std::lock_guard<std::mutex> lk(machnet_connections_mu_);
+      machnet_connections_.push_back(connection);
+      return;
+    }
+
+    // Handle function call responses
+    if (IsFuncCallCompleteMessage(message) ||
+        IsFuncCallFailedMessage(message)) {
+      FuncCall func_call = GetFuncCallFromMessage(message);
+      int64_t recv_time = GetMonotonicMicroTimestamp();
+
+      EngineConnection *origin = nullptr;
+      int64_t send_time = 0;
+      uint64_t recv_index = 0;
+      if (!ConsumeInflight(func_call.full_call_id, &origin, &send_time,
+                           &recv_index)) {
+        return; // Unknown response
+      }
+
+      // Track stats for Machnet
+      std::lock_guard<std::mutex> lk(machnet_stats_mu_);
+      if (IsFuncCallCompleteMessage(message)) {
+        machnet_stats_.completed_count++;
+        if (machnet_warmup_done_.load(std::memory_order_acquire)) {
+          int64_t latency_us = recv_time - send_time;
+          machnet_stats_.latencies_us.push_back(latency_us);
+        }
+      } else if (IsFuncCallFailedMessage(message)) {
+        machnet_stats_.failed_count++;
+      }
+    }
   }
 
   static void MachnetPollCallback(uv_prepare_t *handle) {
