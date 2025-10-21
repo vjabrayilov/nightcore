@@ -4,6 +4,7 @@
 #include "common/uv.h"
 #include "server/server_base.h"
 #include "utils/appendable_buffer.h"
+#include "common/machnet_transport.h"
 
 #include <absl/flags/flag.h>
 #include <algorithm>
@@ -544,6 +545,11 @@ private:
   std::string machnet_ip_;
   uv_tcp_t listen_handle_;
 
+  // Machnet support
+  std::unique_ptr<machnet::MachnetListener> machnet_listener_;
+  uv_prepare_t machnet_poll_prepare_;
+  uv_timer_t machnet_poll_timer_;
+
   // Test parameters (set when test starts)
   int func_id_;
   int method_id_;
@@ -559,22 +565,66 @@ private:
   std::atomic<uint32_t> next_call_id_;
 
   void StartInternal() override {
-    struct sockaddr_in bind_addr;
-    UV_CHECK_OK(uv_tcp_init(uv_loop(), &listen_handle_));
-    listen_handle_.data = this;
+    if (use_machnet_) {
+      CHECK(!machnet_ip_.empty())
+          << "machnet_ip must be set when use_machnet=true";
 
-    UV_CHECK_OK(uv_ip4_addr(listen_addr_.c_str(), listen_port_, &bind_addr));
-    UV_CHECK_OK(
-        uv_tcp_bind(&listen_handle_, (const struct sockaddr *)&bind_addr, 0));
+      // Initialize Machnet channel
+      auto *machnet_channel = machnet::MachnetChannel::Get();
+      CHECK(machnet_channel->Init()) << "Failed to initialize Machnet";
 
-    UV_CHECK_OK(uv_listen(UV_AS_STREAM(&listen_handle_), listen_backlog_,
-                          OnNewConnection));
+      // Create Machnet listener
+      machnet_listener_ =
+          machnet_channel->CreateListener(machnet_ip_, listen_port_);
+      CHECK(machnet_listener_ != nullptr)
+          << "Failed to create Machnet listener";
+
+      machnet_listener_->SetNewConnectionCallback(
+          [this](machnet::MachnetConnection *conn) {
+            OnNewMachnetConnection(conn);
+          });
+
+      // Setup polling callbacks
+      UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
+      machnet_poll_prepare_.data = this;
+      UV_CHECK_OK(
+          uv_prepare_start(&machnet_poll_prepare_, &MachnetPollCallback));
+
+      // Backup timer-based polling
+      UV_CHECK_OK(uv_timer_init(uv_loop(), &machnet_poll_timer_));
+      machnet_poll_timer_.data = this;
+      UV_CHECK_OK(uv_timer_start(&machnet_poll_timer_, &MachnetTimerCallback,
+                                 1, 1));
+
+      LOG(INFO) << "Listening on Machnet " << machnet_ip_ << ":"
+                << listen_port_ << " for Engine connections";
+    } else {
+      // TCP mode
+      struct sockaddr_in bind_addr;
+      UV_CHECK_OK(uv_tcp_init(uv_loop(), &listen_handle_));
+      listen_handle_.data = this;
+
+      UV_CHECK_OK(uv_ip4_addr(listen_addr_.c_str(), listen_port_, &bind_addr));
+      UV_CHECK_OK(
+          uv_tcp_bind(&listen_handle_, (const struct sockaddr *)&bind_addr, 0));
+
+      UV_CHECK_OK(uv_listen(UV_AS_STREAM(&listen_handle_), listen_backlog_,
+                            OnNewConnection));
+    }
   }
 
   void StopInternal() override {
     should_stop_.store(true);
     // Close listener and all active connections so the loop can terminate
-    uv_close(UV_AS_HANDLE(&listen_handle_), nullptr);
+    if (use_machnet_) {
+      uv_prepare_stop(&machnet_poll_prepare_);
+      uv_timer_stop(&machnet_poll_timer_);
+      uv_close(UV_AS_HANDLE(&machnet_poll_prepare_), nullptr);
+      uv_close(UV_AS_HANDLE(&machnet_poll_timer_), nullptr);
+      machnet_listener_.reset();
+    } else {
+      uv_close(UV_AS_HANDLE(&listen_handle_), nullptr);
+    }
     for (auto &conn : connections_) {
       conn->DisableSending();
       conn->Close();
@@ -735,6 +785,37 @@ private:
                                  stats.latencies_us.end());
     }
     return merged;
+  }
+
+  // Machnet support methods
+  void OnNewMachnetConnection(machnet::MachnetConnection *connection) {
+    LOG(INFO) << "New Machnet Engine connection established";
+
+    // Set message callback to handle incoming messages
+    connection->SetMessageCallback(
+        [this, connection](const GatewayMessage &msg,
+                           std::span<const char> payload) {
+          OnRecvMachnetEngineMessage(connection, msg, payload);
+        });
+
+    // For stress_client, we don't need handshake - Engine connects to us
+    // We'll just track this connection for sending requests
+    // TODO: Actually use Machnet connections for sending in the stress test
+  }
+
+  void OnRecvMachnetEngineMessage(machnet::MachnetConnection *connection,
+                                   const GatewayMessage &message,
+                                   std::span<const char> payload) {
+    // For now, just log - in full implementation would handle responses
+    LOG(INFO) << "Received Machnet message from Engine";
+  }
+
+  static void MachnetPollCallback(uv_prepare_t *handle) {
+    machnet::MachnetChannel::Get()->Poll();
+  }
+
+  static void MachnetTimerCallback(uv_timer_t *handle) {
+    machnet::MachnetChannel::Get()->Poll();
   }
 };
 
