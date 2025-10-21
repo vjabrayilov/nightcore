@@ -570,6 +570,7 @@ private:
   std::unique_ptr<machnet::MachnetListener> machnet_listener_;
   uv_prepare_t machnet_poll_prepare_;
   uv_timer_t machnet_poll_timer_;
+  uv_idle_t machnet_send_idle_;  // Idle callback for sending requests
   std::vector<machnet::MachnetConnection *> machnet_connections_;
   std::mutex machnet_connections_mu_;
 
@@ -577,6 +578,11 @@ private:
   ConnectionStats machnet_stats_;
   std::mutex machnet_stats_mu_;
   std::atomic<bool> machnet_warmup_done_{false};
+  std::atomic<bool> machnet_sending_enabled_{false};
+  int64_t machnet_test_start_time_{0};
+  int64_t machnet_test_end_time_{0};
+  int64_t machnet_pacing_window_start_{0};
+  std::atomic<uint32_t> machnet_sent_in_window_{0};
 
   // Test parameters (set when test starts)
   int func_id_;
@@ -624,6 +630,11 @@ private:
       UV_CHECK_OK(uv_timer_start(&machnet_poll_timer_, &MachnetTimerCallback,
                                  1, 1));
 
+      // Setup idle callback for sending requests (runs every event loop iteration)
+      UV_CHECK_OK(uv_idle_init(uv_loop(), &machnet_send_idle_));
+      machnet_send_idle_.data = this;
+      UV_CHECK_OK(uv_idle_start(&machnet_send_idle_, &MachnetSendIdleCallback));
+
       LOG(INFO) << "Listening on Machnet " << machnet_ip_ << ":"
                 << listen_port_ << " for Engine connections";
     } else {
@@ -643,12 +654,15 @@ private:
 
   void StopInternal() override {
     should_stop_.store(true);
+    machnet_sending_enabled_.store(false);
     // Close listener and all active connections so the loop can terminate
     if (use_machnet_) {
       uv_prepare_stop(&machnet_poll_prepare_);
       uv_timer_stop(&machnet_poll_timer_);
+      uv_idle_stop(&machnet_send_idle_);
       uv_close(UV_AS_HANDLE(&machnet_poll_prepare_), nullptr);
       uv_close(UV_AS_HANDLE(&machnet_poll_timer_), nullptr);
+      uv_close(UV_AS_HANDLE(&machnet_send_idle_), nullptr);
       machnet_listener_.reset();
     } else {
       uv_close(UV_AS_HANDLE(&listen_handle_), nullptr);
@@ -814,40 +828,22 @@ private:
       machnet_warmup_done_.store(true);
     }
 
+    // Initialize timing for the idle callback
     start_time_ = GetMonotonicMicroTimestamp();
-    int64_t pacing_window_start_us = start_time_;
-    uint32_t sent_in_window = 0;
+    machnet_test_start_time_ = start_time_;
+    machnet_test_end_time_ = start_time_ + duration_sec * 1000000LL;
+    machnet_pacing_window_start_ = start_time_;
+    machnet_sent_in_window_.store(0);
+
+    // Enable sending (idle callback will start sending)
+    machnet_sending_enabled_.store(true, std::memory_order_release);
 
     // Test phase with periodic reporting
-    int64_t test_end_time = start_time_ + duration_sec * 1000000LL;
     int64_t next_report_time = start_time_ + report_interval * 1000000LL;
 
-    while (GetMonotonicMicroTimestamp() < test_end_time &&
+    while (GetMonotonicMicroTimestamp() < machnet_test_end_time_ &&
            !should_stop_.load()) {
       int64_t now = GetMonotonicMicroTimestamp();
-
-      // Reset pacing window every second
-      if (now - pacing_window_start_us >= 1000000) {
-        pacing_window_start_us = now;
-        sent_in_window = 0;
-      }
-
-      // Calculate how many requests we can send this iteration
-      size_t to_send = 0;
-      if (target_rps_ <= 0) {
-        // Unlimited mode - send in bursts
-        to_send = 100;  // Burst size
-      } else if (sent_in_window < static_cast<uint32_t>(target_rps_)) {
-        // Respect RPS limit
-        to_send = std::min<size_t>(
-            target_rps_ - sent_in_window, 100);  // Max burst of 100
-      }
-
-      // Send requests directly (like Engine does at engine.cpp:123)
-      for (size_t i = 0; i < to_send; i++) {
-        SendMachnetRequest(now);
-        sent_in_window++;
-      }
 
       // Periodic reporting
       if (now >= next_report_time) {
@@ -857,11 +853,13 @@ private:
             start_time_ + (elapsed_sec + report_interval) * 1000000LL;
       }
 
-      // Small sleep to avoid busy loop - event loop handles receiving
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     end_time_ = GetMonotonicMicroTimestamp();
+
+    // Disable sending
+    machnet_sending_enabled_.store(false, std::memory_order_release);
 
     // Wait a bit for inflight requests to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -1049,6 +1047,47 @@ private:
 
   static void MachnetTimerCallback(uv_timer_t *handle) {
     machnet::MachnetChannel::Get()->Poll();
+  }
+
+  static void MachnetSendIdleCallback(uv_idle_t *handle) {
+    auto *self = reinterpret_cast<StressClient *>(handle->data);
+
+    // Check if sending is enabled
+    if (!self->machnet_sending_enabled_.load(std::memory_order_acquire)) {
+      return;
+    }
+
+    int64_t now = GetMonotonicMicroTimestamp();
+
+    // Check if test time is over
+    if (now >= self->machnet_test_end_time_) {
+      return;
+    }
+
+    // Reset pacing window every second
+    if (now - self->machnet_pacing_window_start_ >= 1000000) {
+      self->machnet_pacing_window_start_ = now;
+      self->machnet_sent_in_window_.store(0, std::memory_order_release);
+    }
+
+    // Calculate how many requests we can send this iteration
+    size_t to_send = 0;
+    uint32_t current_sent = self->machnet_sent_in_window_.load(std::memory_order_acquire);
+
+    if (self->target_rps_ <= 0) {
+      // Unlimited mode - send in bursts
+      to_send = 10;  // Small burst per idle iteration
+    } else if (current_sent < static_cast<uint32_t>(self->target_rps_)) {
+      // Respect RPS limit
+      to_send = std::min<size_t>(
+          self->target_rps_ - current_sent, 10);  // Max 10 per iteration
+    }
+
+    // Send requests from event loop thread
+    for (size_t i = 0; i < to_send; i++) {
+      self->SendMachnetRequest(now);
+      self->machnet_sent_in_window_.fetch_add(1, std::memory_order_acq_rel);
+    }
   }
 };
 
