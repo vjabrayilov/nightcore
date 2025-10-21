@@ -663,6 +663,13 @@ private:
       uv_close(UV_AS_HANDLE(&machnet_poll_prepare_), nullptr);
       uv_close(UV_AS_HANDLE(&machnet_poll_timer_), nullptr);
       uv_close(UV_AS_HANDLE(&machnet_send_idle_), nullptr);
+
+      // Clear connections before destroying listener
+      {
+        std::lock_guard<std::mutex> lk(machnet_connections_mu_);
+        machnet_connections_.clear();
+      }
+
       machnet_listener_.reset();
     } else {
       uv_close(UV_AS_HANDLE(&listen_handle_), nullptr);
@@ -1055,6 +1062,14 @@ private:
     // Check if sending is enabled
     if (!self->machnet_sending_enabled_.load(std::memory_order_acquire)) {
       return;
+    }
+
+    // Check if we have valid connections
+    {
+      std::lock_guard<std::mutex> lk(self->machnet_connections_mu_);
+      if (self->machnet_connections_.empty()) {
+        return;
+      }
     }
 
     int64_t now = GetMonotonicMicroTimestamp();
