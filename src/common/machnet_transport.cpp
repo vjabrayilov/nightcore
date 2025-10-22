@@ -117,17 +117,24 @@ MachnetListener::~MachnetListener() {
 }
 
 void MachnetListener::Poll() {
-    // Poll for incoming messages from any flow
+    // Poll for incoming messages from any flow and drain immediately
     constexpr size_t kBufferSize = 65536;
     static char buffer[kBufferSize];
 
-    MachnetFlow_t flow;
-    ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
+    for (;;) {
+        MachnetFlow_t flow;
+        ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
+        if (ret <= 0) {
+            // ret == 0: no data; ret < 0: error
+            if (ret < 0) {
+                VLOG(1) << "machnet_recv() returned error: " << ret;
+            }
+            break;
+        }
 
-    if (ret > 0) {
         VLOG(1) << fmt::format("Listener received {} bytes from flow {}:{} -> {}:{}",
                                 ret, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
-        // New message received
+
         uint64_t flow_id = ((uint64_t)flow.src_ip << 32) |
                           ((uint64_t)flow.src_port << 16) | flow.dst_port;
 
@@ -135,18 +142,12 @@ void MachnetListener::Poll() {
         auto it = connections_.find(flow_id);
 
         if (it == connections_.end()) {
-            // New connection from a remote peer
-            // IMPORTANT: The received flow has src=remote, dst=local
-            // For sending responses, we need dst=remote, so SWAP src/dst
+            // New connection from a remote peer; swap for sending
             MachnetFlow_t send_flow;
-            send_flow.src_ip = flow.dst_ip;      // local IP becomes src
-            send_flow.src_port = flow.dst_port;  // local port becomes src
-            send_flow.dst_ip = flow.src_ip;      // remote IP becomes dst
-            send_flow.dst_port = flow.src_port;  // remote port becomes dst
-
-            LOG(INFO) << fmt::format("Creating connection with swapped flow: {}:{} -> {}:{}",
-                                    send_flow.src_ip, send_flow.src_port,
-                                    send_flow.dst_ip, send_flow.dst_port);
+            send_flow.src_ip = flow.dst_ip;
+            send_flow.src_port = flow.dst_port;
+            send_flow.dst_ip = flow.src_ip;
+            send_flow.dst_port = flow.src_port;
 
             auto new_conn = std::make_unique<MachnetConnection>(channel_, send_flow);
             conn = new_conn.get();
@@ -159,16 +160,10 @@ void MachnetListener::Poll() {
             conn = it->second.get();
         }
 
-        // Append data to connection's read buffer
         if (conn) {
             conn->read_buffer_.AppendData(buffer, ret);
             conn->ProcessMessages();
         }
-    } else if (ret == 0) {
-        // No data available, this is normal
-    } else {
-        // Error
-        LOG(ERROR) << "machnet_recv() failed with error: " << ret;
     }
 }
 
@@ -217,18 +212,20 @@ void MachnetConnection::Poll() {
     constexpr size_t kBufferSize = 65536;
     static char buffer[kBufferSize];
 
-    MachnetFlow_t recv_flow;
-    ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
-
-    if (ret > 0) {
+    for (;;) {
+        MachnetFlow_t recv_flow;
+        ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
+        if (ret <= 0) {
+            if (ret < 0) {
+                VLOG(1) << fmt::format("machnet_recv() error: {}", ret);
+            }
+            break;
+        }
         VLOG(1) << fmt::format("Machnet received {} bytes from flow {}:{} -> {}:{}",
                                 ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port);
         read_buffer_.AppendData(buffer, ret);
         ProcessMessages();
-    } else if (ret < 0) {
-        LOG(ERROR) << fmt::format("machnet_recv() failed with error: {}", ret);
     }
-    // ret == 0 means no data, which is normal - don't log
 }
 
 void MachnetConnection::ProcessMessages() {
