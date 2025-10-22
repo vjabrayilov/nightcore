@@ -125,11 +125,11 @@ void Engine::StartInternal() {
             machnet_connections_.push_back(std::move(conn));
         }
 
-        // Setup aggressive polling callback (runs before each I/O poll for minimal latency)
-        UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
-        machnet_poll_prepare_.data = this;
-        UV_CHECK_OK(uv_prepare_start(&machnet_poll_prepare_, &Engine::MachnetPollCallback));
-        HLOG(INFO) << "Started Machnet aggressive polling callback";
+        // Setup idle callback for continuous aggressive polling (keeps event loop active)
+        UV_CHECK_OK(uv_idle_init(uv_loop(), &machnet_poll_idle_));
+        machnet_poll_idle_.data = this;
+        UV_CHECK_OK(uv_idle_start(&machnet_poll_idle_, &Engine::MachnetPollCallback));
+        HLOG(INFO) << "Started Machnet continuous polling (uv_idle)";
 
         HLOG(INFO) << fmt::format("Created {} Machnet connections to Gateway at {}:{}",
                                   total_gateway_conn, gateway_machnet_ip_, gateway_port_);
@@ -655,7 +655,7 @@ void Engine::DoMachnetPoll() {
     }
 }
 
-void Engine::MachnetPollCallback(uv_prepare_t* handle) {
+void Engine::MachnetPollCallback(uv_idle_t* handle) {
     // Verify handle data is valid
     if (handle == nullptr || handle->data == nullptr) {
         LOG(ERROR) << "Engine MachnetPollCallback: Invalid handle or data pointer!";

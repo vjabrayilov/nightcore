@@ -61,7 +61,7 @@ private:
     bool use_machnet_;
     std::string machnet_ip_;
     std::unique_ptr<machnet::MachnetListener> machnet_listener_;
-    uv_prepare_t machnet_poll_prepare_;
+    uv_idle_t machnet_poll_idle_;  // Idle callback for continuous polling
     absl::flat_hash_map</* node_id */ uint16_t, machnet::MachnetConnection*>
         machnet_engine_connections_;
 
@@ -149,7 +149,7 @@ private:
                                      const protocol::GatewayMessage& message,
                                      std::span<const char> payload);
     machnet::MachnetConnection* GetMachnetEngineConnection(uint16_t node_id);
-    static void MachnetPollCallback(uv_prepare_t* handle);
+    static void MachnetPollCallback(uv_idle_t* handle);
 
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(HttpConnection);
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(GrpcConnection);
