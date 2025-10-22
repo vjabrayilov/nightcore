@@ -1053,14 +1053,12 @@ private:
       if (machnet_inflight_per_conn_.size() < machnet_connections_.size()) {
         machnet_inflight_per_conn_.resize(machnet_connections_.size(), 0);
       }
-      // Recompute per-connection inflight limits
+      // Recompute per-connection inflight limits (per-connection semantics)
       machnet_per_conn_limit_.resize(machnet_connections_.size(), 0);
       size_t n = machnet_connections_.size();
       if (inflight_limit_ > 0) {
-        size_t base = static_cast<size_t>(inflight_limit_) / n;
-        size_t rem = static_cast<size_t>(inflight_limit_) % n;
         for (size_t i = 0; i < n; i++) {
-          machnet_per_conn_limit_[i] = base + (i < rem ? 1 : 0);
+          machnet_per_conn_limit_[i] = static_cast<size_t>(inflight_limit_);
         }
       } else {
         // Safe default to avoid Machnet SHM/ring overflow under unlimited mode
@@ -1144,10 +1142,13 @@ private:
       return;
     }
 
-    // Reset pacing window every second
-    if (now - self->machnet_pacing_window_start_ >= 1000000) {
+    // Token-bucket style pacing: allow sends proportionally within the second
+    int64_t elapsed_us = now - self->machnet_pacing_window_start_;
+    if (elapsed_us >= 1000000) {
+      // Advance the window to now; reset counters
       self->machnet_pacing_window_start_ = now;
       self->machnet_sent_in_window_.store(0, std::memory_order_release);
+      elapsed_us = 0;
     }
 
     // Check inflight limit (critical for Machnet to avoid buffer overflow)
@@ -1174,19 +1175,26 @@ private:
     // Calculate capacity left
     size_t capacity_left = total_allowed_inflight - static_cast<size_t>(current_inflight);
 
-    // Calculate RPS quota left
-    size_t quota_left = capacity_left;
+    // Calculate RPS quota left (smoothed)
+    size_t to_send = capacity_left;
     uint32_t current_sent = self->machnet_sent_in_window_.load(std::memory_order_acquire);
     if (self->target_rps_ > 0) {
-      if (current_sent >= static_cast<uint32_t>(self->target_rps_)) {
-        return;  // RPS limit reached for this second
+      // Expected sends so far in this second
+      uint64_t expected = (static_cast<uint64_t>(self->target_rps_) * static_cast<uint64_t>(elapsed_us)) / 1000000ULL;
+      if (expected <= current_sent) {
+        return;  // Not time to send the next request yet
       }
-      quota_left = std::min(quota_left,
-          static_cast<size_t>(self->target_rps_ - current_sent));
+      uint64_t permitted = expected - current_sent;  // how many we can send now
+      if (permitted == 0) {
+        return;
+      }
+      to_send = std::min<size_t>(to_send, static_cast<size_t>(permitted));
+      // Bound micro-burst size to keep pressure low on Machnet rings
+      to_send = std::min<size_t>(to_send, static_cast<size_t>(8));
+    } else {
+      // Unlimited mode: still cap micro-burst
+      to_send = std::min<size_t>(to_send, static_cast<size_t>(8));
     }
-
-    // Send in small bursts to avoid overwhelming Machnet buffers
-    size_t to_send = std::min(quota_left, static_cast<size_t>(8));
 
     // Send requests from event loop thread; stop early if all conns saturated
     size_t sent = 0;
