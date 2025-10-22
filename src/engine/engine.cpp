@@ -125,18 +125,11 @@ void Engine::StartInternal() {
             machnet_connections_.push_back(std::move(conn));
         }
 
-        // Setup polling callback (uv_prepare - runs before each I/O poll)
+        // Setup aggressive polling callback (runs before each I/O poll for minimal latency)
         UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
         machnet_poll_prepare_.data = this;
         UV_CHECK_OK(uv_prepare_start(&machnet_poll_prepare_, &Engine::MachnetPollCallback));
-        HLOG(INFO) << "Started Machnet prepare polling callback";
-
-        // Setup backup timer-based polling (every 1ms) to ensure polling never stops
-        UV_CHECK_OK(uv_timer_init(uv_loop(), &machnet_poll_timer_));
-        machnet_poll_timer_.data = this;
-        UV_CHECK_OK(uv_timer_start(&machnet_poll_timer_, &Engine::MachnetTimerCallback,
-                                   1, 1));  // Start after 1ms, repeat every 1ms
-        HLOG(INFO) << "Started Machnet timer polling callback (1ms interval)";
+        HLOG(INFO) << "Started Machnet aggressive polling callback";
 
         HLOG(INFO) << fmt::format("Created {} Machnet connections to Gateway at {}:{}",
                                   total_gateway_conn, gateway_machnet_ip_, gateway_port_);
@@ -669,15 +662,6 @@ void Engine::MachnetPollCallback(uv_prepare_t* handle) {
         return;
     }
 
-    Engine* engine = reinterpret_cast<Engine*>(handle->data);
-    engine->DoMachnetPoll();
-}
-
-void Engine::MachnetTimerCallback(uv_timer_t* handle) {
-    if (handle == nullptr || handle->data == nullptr) {
-        LOG(ERROR) << "Engine MachnetTimerCallback: Invalid handle pointer!";
-        return;
-    }
     Engine* engine = reinterpret_cast<Engine*>(handle->data);
     engine->DoMachnetPoll();
 }

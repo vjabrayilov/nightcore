@@ -105,16 +105,11 @@ void Server::StartInternal() {
                 OnNewMachnetEngineConnection(conn);
             });
 
-        // Setup polling callback
+        // Setup aggressive polling callback for minimal latency
         UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
         machnet_poll_prepare_.data = this;
         UV_CHECK_OK(uv_prepare_start(&machnet_poll_prepare_, &Server::MachnetPollCallback));
-
-        // Backup timer-based polling to ensure regular machnet_recv
-        UV_CHECK_OK(uv_timer_init(uv_loop(), &machnet_poll_timer_));
-        machnet_poll_timer_.data = this;
-        UV_CHECK_OK(uv_timer_start(&machnet_poll_timer_, &Server::MachnetTimerCallback, 1, 1));
-        HLOG(INFO) << "Started Machnet prepare and timer polling callbacks";
+        HLOG(INFO) << "Started Machnet aggressive polling callback";
 
         HLOG(INFO) << fmt::format("Listening on Machnet {}:{} for engine connections",
                                   machnet_ip_, engine_conn_port_);
@@ -741,11 +736,6 @@ machnet::MachnetConnection* Server::GetMachnetEngineConnection(uint16_t node_id)
 }
 
 void Server::MachnetPollCallback(uv_prepare_t* handle) {
-    (void)handle;  // Unused parameter
-    machnet::MachnetChannel::Get()->Poll();
-}
-
-void Server::MachnetTimerCallback(uv_timer_t* handle) {
     (void)handle;  // Unused parameter
     machnet::MachnetChannel::Get()->Poll();
 }

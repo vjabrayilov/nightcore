@@ -189,19 +189,42 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
     VLOG(1) << fmt::format("SendMessage: using flow {}:{} -> {}:{}, channel={:p}",
                             flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port, channel_);
 
-    // Send header
-    int ret = machnet_send(channel_, flow_, &message, sizeof(protocol::GatewayMessage));
-    if (ret != 0) {
-        LOG(ERROR) << "machnet_send() failed for header with error: " << ret;
-        return false;
-    }
-
-    // Send payload if present
-    if (payload.size() > 0) {
-        ret = machnet_send(channel_, flow_, payload.data(), payload.size());
+    // Optimize: send header+payload in one call to reduce overhead
+    if (payload.empty()) {
+        // No payload - send header only
+        int ret = machnet_send(channel_, flow_, &message, sizeof(protocol::GatewayMessage));
         if (ret != 0) {
-            LOG(ERROR) << "machnet_send() failed for payload with error: " << ret;
+            LOG(ERROR) << "machnet_send() failed for header with error: " << ret;
             return false;
+        }
+    } else {
+        // Batch header and payload into a single buffer for one machnet_send() call
+        // This significantly reduces syscall overhead
+        size_t total_size = sizeof(protocol::GatewayMessage) + payload.size();
+
+        // Use stack allocation for small messages (common case)
+        constexpr size_t kStackBufferSize = 4096;
+        if (total_size <= kStackBufferSize) {
+            char stack_buffer[kStackBufferSize];
+            memcpy(stack_buffer, &message, sizeof(protocol::GatewayMessage));
+            memcpy(stack_buffer + sizeof(protocol::GatewayMessage), payload.data(), payload.size());
+
+            int ret = machnet_send(channel_, flow_, stack_buffer, total_size);
+            if (ret != 0) {
+                LOG(ERROR) << "machnet_send() failed with error: " << ret;
+                return false;
+            }
+        } else {
+            // Heap allocation for large messages
+            std::vector<char> buffer(total_size);
+            memcpy(buffer.data(), &message, sizeof(protocol::GatewayMessage));
+            memcpy(buffer.data() + sizeof(protocol::GatewayMessage), payload.data(), payload.size());
+
+            int ret = machnet_send(channel_, flow_, buffer.data(), total_size);
+            if (ret != 0) {
+                LOG(ERROR) << "machnet_send() failed with error: " << ret;
+                return false;
+            }
         }
     }
 
