@@ -573,6 +573,11 @@ private:
   uv_idle_t machnet_send_idle_;  // Idle callback for sending requests
   std::vector<machnet::MachnetConnection *> machnet_connections_;
   std::mutex machnet_connections_mu_;
+  // Machnet per-connection inflight tracking and selection
+  std::vector<size_t> machnet_inflight_per_conn_;
+  std::vector<size_t> machnet_per_conn_limit_;
+  absl::flat_hash_map<machnet::MachnetConnection *, size_t> machnet_conn_index_;
+  size_t machnet_rr_next_{0};
 
   // Machnet stress test state
   ConnectionStats machnet_stats_;
@@ -583,6 +588,8 @@ private:
   int64_t machnet_test_end_time_{0};
   int64_t machnet_pacing_window_start_{0};
   std::atomic<uint32_t> machnet_sent_in_window_{0};
+  std::atomic<uint64_t> machnet_inflight_count_{0};
+  std::string machnet_input_buffer_;
 
   // Test parameters (set when test starts)
   int func_id_;
@@ -842,6 +849,9 @@ private:
     machnet_pacing_window_start_ = start_time_;
     machnet_sent_in_window_.store(0);
 
+    // Prepare reusable input buffer for Machnet sends
+    machnet_input_buffer_.assign(input_size_, 'x');
+
     // Enable sending (idle callback will start sending)
     machnet_sending_enabled_.store(true, std::memory_order_release);
 
@@ -876,17 +886,32 @@ private:
     PrintMachnetFinalResults();
   }
 
-  void SendMachnetRequest(int64_t send_time) {
+  bool SendMachnetRequest(int64_t send_time) {
     std::lock_guard<std::mutex> lk(machnet_connections_mu_);
     if (machnet_connections_.empty()) {
-      return;
+      return false;
     }
 
-    // Round-robin across connections
-    static size_t next_conn = 0;
-    machnet::MachnetConnection *conn =
-        machnet_connections_[next_conn % machnet_connections_.size()];
-    next_conn++;
+    // Pick a connection with available per-connection capacity (round-robin)
+    size_t n = machnet_connections_.size();
+    size_t start = machnet_rr_next_ % n;
+    size_t picked = n;  // invalid
+    for (size_t i = 0; i < n; i++) {
+      size_t idx = (start + i) % n;
+      size_t limit = idx < machnet_per_conn_limit_.size() ? machnet_per_conn_limit_[idx] : 0;
+      size_t inflight = idx < machnet_inflight_per_conn_.size() ? machnet_inflight_per_conn_[idx] : 0;
+      if (limit == 0 || inflight >= limit) {
+        continue;
+      }
+      picked = idx;
+      break;
+    }
+    if (picked == n) {
+      // All connections saturated
+      return false;
+    }
+    machnet_rr_next_ = picked + 1;
+    machnet::MachnetConnection *conn = machnet_connections_[picked];
 
     // Create function call
     uint16_t client_id = 0;
@@ -900,10 +925,10 @@ private:
     GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
     message.payload_size = input_size_;
 
-    // Send via Machnet
-    std::string input_buffer(input_size_, 'x');
-    bool success =
-        conn->SendMessage(message, std::span<const char>(input_buffer.data(), input_size_));
+    // Send via Machnet (reuse preallocated buffer)
+    bool success = conn->SendMessage(
+        message,
+        std::span<const char>(machnet_input_buffer_.data(), machnet_input_buffer_.size()));
 
     if (success) {
       // Track stats - for Machnet we don't have per-connection tracking,
@@ -917,10 +942,16 @@ private:
       }
 
       RegisterInflight(func_call.full_call_id, stats_tracker.get(), send_time, 0);
-
+      // Increment inflight counters after successful send
+      machnet_inflight_count_.fetch_add(1, std::memory_order_acq_rel);
+      if (picked < machnet_inflight_per_conn_.size()) {
+        machnet_inflight_per_conn_[picked]++;
+      }
       std::lock_guard<std::mutex> stats_lk(machnet_stats_mu_);
       machnet_stats_.sent_count++;
     }
+
+    return success;
   }
 
   void PrintMachnetProgress(int elapsed_sec) {
@@ -1017,6 +1048,27 @@ private:
                 << message.node_id;
       std::lock_guard<std::mutex> lk(machnet_connections_mu_);
       machnet_connections_.push_back(connection);
+      size_t idx = machnet_connections_.size() - 1;
+      machnet_conn_index_[connection] = idx;
+      if (machnet_inflight_per_conn_.size() < machnet_connections_.size()) {
+        machnet_inflight_per_conn_.resize(machnet_connections_.size(), 0);
+      }
+      // Recompute per-connection inflight limits
+      machnet_per_conn_limit_.resize(machnet_connections_.size(), 0);
+      size_t n = machnet_connections_.size();
+      if (inflight_limit_ > 0) {
+        size_t base = static_cast<size_t>(inflight_limit_) / n;
+        size_t rem = static_cast<size_t>(inflight_limit_) % n;
+        for (size_t i = 0; i < n; i++) {
+          machnet_per_conn_limit_[i] = base + (i < rem ? 1 : 0);
+        }
+      } else {
+        // Safe default to avoid Machnet SHM/ring overflow under unlimited mode
+        constexpr size_t kDefaultPerConnInflight = 32;
+        for (size_t i = 0; i < n; i++) {
+          machnet_per_conn_limit_[i] = kDefaultPerConnInflight;
+        }
+      }
       return;
     }
 
@@ -1032,6 +1084,19 @@ private:
       if (!ConsumeInflight(func_call.full_call_id, &origin, &send_time,
                            &recv_index)) {
         return; // Unknown response
+      }
+
+      // Decrement inflight counts (global and per-connection)
+      machnet_inflight_count_.fetch_sub(1, std::memory_order_acq_rel);
+      {
+        std::lock_guard<std::mutex> lk(machnet_connections_mu_);
+        auto it_idx = machnet_conn_index_.find(connection);
+        if (it_idx != machnet_conn_index_.end()) {
+          size_t cidx = it_idx->second;
+          if (cidx < machnet_inflight_per_conn_.size() && machnet_inflight_per_conn_[cidx] > 0) {
+            machnet_inflight_per_conn_[cidx]--;
+          }
+        }
       }
 
       // Track stats for Machnet
@@ -1085,22 +1150,50 @@ private:
       self->machnet_sent_in_window_.store(0, std::memory_order_release);
     }
 
-    // Calculate how many requests we can send this iteration
-    size_t to_send = 0;
-    uint32_t current_sent = self->machnet_sent_in_window_.load(std::memory_order_acquire);
-
-    if (self->target_rps_ <= 0) {
-      // Unlimited mode - send in bursts
-      to_send = 10;  // Small burst per idle iteration
-    } else if (current_sent < static_cast<uint32_t>(self->target_rps_)) {
-      // Respect RPS limit
-      to_send = std::min<size_t>(
-          self->target_rps_ - current_sent, 10);  // Max 10 per iteration
+    // Check inflight limit (critical for Machnet to avoid buffer overflow)
+    uint64_t current_inflight = self->machnet_inflight_count_.load(std::memory_order_acquire);
+    size_t num_conns = 0;
+    {
+      std::lock_guard<std::mutex> lk(self->machnet_connections_mu_);
+      num_conns = self->machnet_connections_.size();
+    }
+    if (num_conns == 0) {
+      return;
+    }
+    size_t total_allowed_inflight = 0;
+    if (self->inflight_limit_ > 0) {
+      total_allowed_inflight = static_cast<size_t>(self->inflight_limit_);
+    } else {
+      // Safe default cap under unlimited mode: per-connection 32
+      total_allowed_inflight = num_conns * 32;
+    }
+    if (current_inflight >= total_allowed_inflight) {
+      return;  // At capacity, wait for responses
     }
 
-    // Send requests from event loop thread
-    for (size_t i = 0; i < to_send; i++) {
-      self->SendMachnetRequest(now);
+    // Calculate capacity left
+    size_t capacity_left = total_allowed_inflight - static_cast<size_t>(current_inflight);
+
+    // Calculate RPS quota left
+    size_t quota_left = capacity_left;
+    uint32_t current_sent = self->machnet_sent_in_window_.load(std::memory_order_acquire);
+    if (self->target_rps_ > 0) {
+      if (current_sent >= static_cast<uint32_t>(self->target_rps_)) {
+        return;  // RPS limit reached for this second
+      }
+      quota_left = std::min(quota_left,
+          static_cast<size_t>(self->target_rps_ - current_sent));
+    }
+
+    // Send in small bursts to avoid overwhelming Machnet buffers
+    size_t to_send = std::min(quota_left, static_cast<size_t>(8));
+
+    // Send requests from event loop thread; stop early if all conns saturated
+    size_t sent = 0;
+    for (; sent < to_send; sent++) {
+      if (!self->SendMachnetRequest(now)) {
+        break;  // No available capacity per-connection
+      }
       self->machnet_sent_in_window_.fetch_add(1, std::memory_order_acq_rel);
     }
   }
