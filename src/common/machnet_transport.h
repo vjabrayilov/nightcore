@@ -52,6 +52,9 @@ public:
     // Poll for incoming messages (should be called from event loop)
     void Poll();
 
+    // Try to poll for incoming messages (should be called from event loop)
+    void TryPoll();
+
     // Register/unregister listeners for polling
     void RegisterListener(MachnetListener* listener);
     void UnregisterListener(MachnetListener* listener);
@@ -82,6 +85,9 @@ public:
 
     // Poll for incoming connections
     void Poll();
+
+    // Try to poll for incoming messages
+    void TryPoll();
 
     const std::string& local_ip() const { return local_ip_; }
     uint16_t port() const { return port_; }

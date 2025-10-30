@@ -454,8 +454,7 @@ public:
     while (true) {
       bool has_connections = false;
       if (use_machnet_) {
-        std::lock_guard<std::mutex> lk(machnet_connections_mu_);
-        has_connections = !machnet_connections_.empty();
+        has_connections = (machnet_single_conn_ != nullptr);
       } else {
         has_connections = !connections_.empty();
       }
@@ -472,7 +471,7 @@ public:
     }
 
     size_t num_connections = use_machnet_
-        ? ([&]() { std::lock_guard<std::mutex> lk(machnet_connections_mu_); return machnet_connections_.size(); })()
+        ? (machnet_single_conn_ != nullptr ? 1 : 0)
         : connections_.size();
 
     LOG(INFO) << "Engine connected with " << num_connections
@@ -533,7 +532,8 @@ public:
       }
     }
 
-    start_time_ = GetMonotonicMicroTimestamp();
+    // start_time_ = GetMonotonicMicroTimestamp();
+    start_time_ = uv_hrtime() / 1000;  // convert ns -> us
 
     // Test phase with periodic reporting
     for (int elapsed = 0; elapsed < duration_sec && !should_stop_.load();
@@ -546,7 +546,8 @@ public:
       }
     }
 
-    end_time_ = GetMonotonicMicroTimestamp();
+    // end_time_ = GetMonotonicMicroTimestamp();
+    end_time_ = uv_hrtime() / 1000;  // convert ns -> us
 
     // Disable sending on all connections
     for (auto &conn : connections_) {
@@ -568,29 +569,24 @@ private:
 
   // Machnet support
   std::unique_ptr<machnet::MachnetListener> machnet_listener_;
-  uv_prepare_t machnet_poll_prepare_;
   uv_idle_t machnet_send_idle_;  // Idle callback for sending requests
-  std::vector<machnet::MachnetConnection *> machnet_connections_;
-  std::mutex machnet_connections_mu_;
-  // Machnet per-connection inflight tracking and selection
-  std::vector<size_t> machnet_inflight_per_conn_;
-  std::vector<size_t> machnet_per_conn_limit_;
-  absl::flat_hash_map<machnet::MachnetConnection *, size_t> machnet_conn_index_;
-  size_t machnet_rr_next_{0};
-  // Machnet per-connection target and pacing
-  std::vector<uint32_t> machnet_target_rps_per_conn_;
-  std::vector<uint32_t> machnet_sent_in_window_per_conn_;
+  uv_idle_t machnet_poll_idle_;  // Idle callback for polling
+  // Single-connection Machnet mode
+  std::mutex machnet_connections_mu_;  // retained for future extension
 
   // Machnet stress test state
   ConnectionStats machnet_stats_;
   std::mutex machnet_stats_mu_;
   std::atomic<bool> machnet_warmup_done_{false};
   std::atomic<bool> machnet_sending_enabled_{false};
-  int64_t machnet_test_start_time_{0};
-  int64_t machnet_test_end_time_{0};
-  int64_t machnet_pacing_window_start_{0};
-  std::atomic<uint32_t> machnet_sent_in_window_{0};
-  std::atomic<uint64_t> machnet_inflight_count_{0};
+  uint64_t machnet_test_start_time_{0};
+  uint64_t machnet_test_end_time_{0};
+  // Single-connection open-loop scheduling
+  machnet::MachnetConnection *machnet_single_conn_{nullptr};
+  uint64_t machnet_inter_send_us_{0};
+  uint64_t machnet_next_send_time_{0};
+  uint32_t machnet_base_call_id_start_{0};
+  std::vector<int64_t> machnet_send_ts_by_index_;
   std::string machnet_input_buffer_;
 
   // Test parameters (set when test starts)
@@ -603,8 +599,8 @@ private:
   std::vector<std::unique_ptr<EngineConnection>> connections_;
   std::atomic<bool> should_stop_;
   bool test_started_;
-  int64_t start_time_;
-  int64_t end_time_;
+  uint64_t start_time_;
+  uint64_t end_time_;
   std::atomic<uint32_t> next_call_id_;
 
   void StartInternal() override {
@@ -627,16 +623,15 @@ private:
             OnNewMachnetConnection(conn);
           });
 
-      // Setup aggressive polling callback (runs before every event loop iteration)
-      UV_CHECK_OK(uv_prepare_init(uv_loop(), &machnet_poll_prepare_));
-      machnet_poll_prepare_.data = this;
-      UV_CHECK_OK(
-          uv_prepare_start(&machnet_poll_prepare_, &MachnetPollCallback));
-
       // Setup idle callback for sending requests (runs every event loop iteration)
       UV_CHECK_OK(uv_idle_init(uv_loop(), &machnet_send_idle_));
       machnet_send_idle_.data = this;
       UV_CHECK_OK(uv_idle_start(&machnet_send_idle_, &MachnetSendIdleCallback));
+
+      // Setup idle callback for polling (runs every event loop iteration)
+      UV_CHECK_OK(uv_idle_init(uv_loop(), &machnet_poll_idle_));
+      machnet_poll_idle_.data = this;
+      UV_CHECK_OK(uv_idle_start(&machnet_poll_idle_, &MachnetPollCallback));
 
       LOG(INFO) << "Listening on Machnet " << machnet_ip_ << ":"
                 << listen_port_ << " for Engine connections";
@@ -660,17 +655,11 @@ private:
     machnet_sending_enabled_.store(false);
     // Close listener and all active connections so the loop can terminate
     if (use_machnet_) {
-      uv_prepare_stop(&machnet_poll_prepare_);
       uv_idle_stop(&machnet_send_idle_);
-      uv_close(UV_AS_HANDLE(&machnet_poll_prepare_), nullptr);
+      uv_idle_stop(&machnet_poll_idle_);
       uv_close(UV_AS_HANDLE(&machnet_send_idle_), nullptr);
-
-      // Clear connections before destroying listener
-      {
-        std::lock_guard<std::mutex> lk(machnet_connections_mu_);
-        machnet_connections_.clear();
-      }
-
+      uv_close(UV_AS_HANDLE(&machnet_poll_idle_), nullptr);
+      machnet_single_conn_ = nullptr;
       machnet_listener_.reset();
     } else {
       uv_close(UV_AS_HANDLE(&listen_handle_), nullptr);
@@ -825,7 +814,7 @@ private:
 
   void RunMachnetStressTest(int warmup_sec, int duration_sec,
                              int report_interval) {
-    // Warmup phase
+    // Warmup phase: no sending during warmup
     if (warmup_sec > 0) {
       LOG(INFO) << "Warmup phase: " << warmup_sec << " seconds...";
       std::this_thread::sleep_for(std::chrono::seconds(warmup_sec));
@@ -836,46 +825,48 @@ private:
       machnet_warmup_done_.store(true);
     }
 
-    // Initialize timing for the idle callback
-    start_time_ = GetMonotonicMicroTimestamp();
+    // Initialize timing and scheduling for open-loop sending
+    CHECK_GT(target_rps_, 0);
+    // start_time_ = GetMonotonicMicroTimestamp();
+    start_time_ = uv_hrtime() / 1000;  // convert ns -> us
     machnet_test_start_time_ = start_time_;
     machnet_test_end_time_ = start_time_ + duration_sec * 1000000LL;
-    machnet_pacing_window_start_ = start_time_;
-    machnet_sent_in_window_.store(0);
+    machnet_inter_send_us_ = std::max<uint64_t>(1, 1000000LL / target_rps_);
+    machnet_next_send_time_ = start_time_;
 
     // Prepare reusable input buffer for Machnet sends
     machnet_input_buffer_.assign(input_size_, 'x');
 
-    // Enable sending (idle callback will start sending)
+    // Preallocate tracking for request timestamps and latencies
+    machnet_base_call_id_start_ = next_call_id_.load(std::memory_order_relaxed);
+    size_t expected_requests = static_cast<size_t>(duration_sec) * static_cast<size_t>(target_rps_);
+    machnet_send_ts_by_index_.assign(expected_requests, 0);
+    {
+      std::lock_guard<std::mutex> stats_lk(machnet_stats_mu_);
+      machnet_stats_.latencies_us.reserve(expected_requests);
+    }
+
+    // Enable sending (idle callback will handle send/poll)
     machnet_sending_enabled_.store(true, std::memory_order_release);
 
     // Test phase with periodic reporting
-    int64_t next_report_time = start_time_ + report_interval * 1000000LL;
-
-    while (GetMonotonicMicroTimestamp() < machnet_test_end_time_ &&
+    uint64_t next_report_time = start_time_ + report_interval * 1000000LL;
+    // while (GetMonotonicMicroTimestamp() < machnet_test_end_time_ &&
+    while ((uv_hrtime() / 1000) < machnet_test_end_time_ &&
            !should_stop_.load()) {
-      int64_t now = GetMonotonicMicroTimestamp();
-
-      // Periodic reporting
+      uint64_t now = uv_hrtime() / 1000;  // convert ns -> us
       if (now >= next_report_time) {
         int elapsed_sec = (now - start_time_) / 1000000;
         PrintMachnetProgress(elapsed_sec);
-        next_report_time =
-            start_time_ + (elapsed_sec + report_interval) * 1000000LL;
+        next_report_time = start_time_ + (elapsed_sec + report_interval) * 1000000LL;
       }
-
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     end_time_ = GetMonotonicMicroTimestamp();
-
-    // Disable sending
     machnet_sending_enabled_.store(false, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // Wait a bit for inflight requests to complete
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // Print final results
     LOG(INFO) << "";
     PrintMachnetFinalResults();
   }
@@ -889,7 +880,6 @@ private:
   }
 
   void PrintMachnetFinalResults() {
-    std::lock_guard<std::mutex> lk(machnet_connections_mu_);
     std::lock_guard<std::mutex> stats_lk(machnet_stats_mu_);
 
     double duration_sec = (end_time_ - start_time_) / 1e6;
@@ -898,7 +888,7 @@ private:
     LOG(INFO) << "========================================";
     LOG(INFO) << "=== Stress Test Results ===";
     LOG(INFO) << "========================================";
-    LOG(INFO) << fmt::format("Connections:       {}", machnet_connections_.size());
+    LOG(INFO) << fmt::format("Connections:       {}", machnet_single_conn_ != nullptr ? 1 : 0);
     LOG(INFO) << fmt::format("Duration:          {:.2f} seconds", duration_sec);
     LOG(INFO) << fmt::format("Total Sent:        {}", machnet_stats_.sent_count);
     LOG(INFO) << fmt::format(
@@ -968,46 +958,11 @@ private:
   void OnRecvMachnetEngineMessage(machnet::MachnetConnection *connection,
                                    const GatewayMessage &message,
                                    std::span<const char> payload) {
-    // Handle handshake - just track the connection
+    // Handle handshake - single connection
     if (IsEngineHandshakeMessage(message)) {
       LOG(INFO) << "Machnet Engine handshake received from node_id="
                 << message.node_id;
-      std::lock_guard<std::mutex> lk(machnet_connections_mu_);
-      machnet_connections_.push_back(connection);
-      size_t idx = machnet_connections_.size() - 1;
-      machnet_conn_index_[connection] = idx;
-      if (machnet_inflight_per_conn_.size() < machnet_connections_.size()) {
-        machnet_inflight_per_conn_.resize(machnet_connections_.size(), 0);
-      }
-      // Recompute per-connection inflight limits (per-connection semantics)
-      machnet_per_conn_limit_.resize(machnet_connections_.size(), 0);
-      size_t n = machnet_connections_.size();
-      if (inflight_limit_ > 0) {
-        for (size_t i = 0; i < n; i++) {
-          machnet_per_conn_limit_[i] = static_cast<size_t>(inflight_limit_);
-        }
-      } else {
-        // Safe default to avoid Machnet SHM/ring overflow under unlimited mode
-        constexpr size_t kDefaultPerConnInflight = 256;
-        for (size_t i = 0; i < n; i++) {
-          machnet_per_conn_limit_[i] = kDefaultPerConnInflight;
-        }
-      }
-
-      // Recompute per-connection target RPS distribution similar to TCP mode
-      machnet_target_rps_per_conn_.resize(n, 0);
-      machnet_sent_in_window_per_conn_.resize(n, 0);
-      if (target_rps_ > 0) {
-        uint32_t base = static_cast<uint32_t>(target_rps_ / static_cast<int>(n));
-        uint32_t rem = static_cast<uint32_t>(target_rps_ % static_cast<int>(n));
-        for (size_t i = 0; i < n; i++) {
-          machnet_target_rps_per_conn_[i] = base + (static_cast<uint32_t>(i) < rem ? 1U : 0U);
-        }
-      } else {
-        for (size_t i = 0; i < n; i++) {
-          machnet_target_rps_per_conn_[i] = 0;  // unlimited per-connection
-        }
-      }
+      machnet_single_conn_ = connection;
       return;
     }
 
@@ -1017,32 +972,17 @@ private:
       FuncCall func_call = GetFuncCallFromMessage(message);
       int64_t recv_time = GetMonotonicMicroTimestamp();
 
-      EngineConnection *origin = nullptr;
+      size_t idx = static_cast<size_t>(func_call.call_id - machnet_base_call_id_start_);
       int64_t send_time = 0;
-      uint64_t recv_index = 0;
-      if (!ConsumeInflight(func_call.full_call_id, &origin, &send_time,
-                           &recv_index)) {
-        return; // Unknown response
-      }
-
-      // Decrement inflight counts (global and per-connection)
-      machnet_inflight_count_.fetch_sub(1, std::memory_order_acq_rel);
-      {
-        std::lock_guard<std::mutex> lk(machnet_connections_mu_);
-        auto it_idx = machnet_conn_index_.find(connection);
-        if (it_idx != machnet_conn_index_.end()) {
-          size_t cidx = it_idx->second;
-          if (cidx < machnet_inflight_per_conn_.size() && machnet_inflight_per_conn_[cidx] > 0) {
-            machnet_inflight_per_conn_[cidx]--;
-          }
-        }
+      if (idx < machnet_send_ts_by_index_.size()) {
+        send_time = machnet_send_ts_by_index_[idx];
       }
 
       // Track stats for Machnet
       std::lock_guard<std::mutex> lk(machnet_stats_mu_);
       if (IsFuncCallCompleteMessage(message)) {
         machnet_stats_.completed_count++;
-        if (machnet_warmup_done_.load(std::memory_order_acquire)) {
+        if (machnet_warmup_done_.load(std::memory_order_acquire) && send_time > 0) {
           int64_t latency_us = recv_time - send_time;
           machnet_stats_.latencies_us.push_back(latency_us);
         }
@@ -1052,147 +992,59 @@ private:
     }
   }
 
-  static void MachnetPollCallback(uv_prepare_t *handle) {
-    // Poll aggressively before each event loop iteration
-    machnet::MachnetChannel::Get()->Poll();
-  }
+static void MachnetPollCallback(uv_idle_t *handle) {
+  machnet::MachnetChannel::Get()->TryPoll();
+}
 
   static void MachnetSendIdleCallback(uv_idle_t *handle) {
     auto *self = reinterpret_cast<StressClient *>(handle->data);
 
-    // Fast path: check if sending is enabled (no lock needed)
     if (!self->machnet_sending_enabled_.load(std::memory_order_acquire)) {
       return;
     }
+    if (self->machnet_single_conn_ == nullptr) {
+      return;
+    }
 
-    int64_t now = GetMonotonicMicroTimestamp();
-
-    // Check if test time is over
+    // int64_t now = GetMonotonicMicroTimestamp();
+    uint64_t now = uv_hrtime() / 1000;  // convert ns -> us
     if (now >= self->machnet_test_end_time_) {
       return;
     }
 
-    // Token-bucket style pacing: reset window if needed
-    int64_t elapsed_us = now - self->machnet_pacing_window_start_;
-    if (elapsed_us >= 1000000) {
-      self->machnet_pacing_window_start_ = now;
-      self->machnet_sent_in_window_.store(0, std::memory_order_release);
-      elapsed_us = 0;
+    if (now < self->machnet_next_send_time_) {
+      return;  // not time yet; already polled above
     }
 
-    // Check global inflight limit (fast check without lock)
-    uint64_t current_inflight = self->machnet_inflight_count_.load(std::memory_order_acquire);
+    // Send exactly one request
+    uint16_t client_id = 0;
+    uint32_t call_id = self->next_call_id_.fetch_add(1, std::memory_order_relaxed);
+    protocol::FuncCall func_call = protocol::NewFuncCall(self->func_id_, client_id, call_id);
+    if (self->method_id_ > 0) {
+      func_call.method_id = self->method_id_;
+    }
+    protocol::GatewayMessage message = protocol::NewDispatchFuncCallGatewayMessage(func_call);
+    message.payload_size = self->input_size_;
 
-    // Now take the lock ONCE and do all the work
-    std::lock_guard<std::mutex> lk(self->machnet_connections_mu_);
-
-    if (self->machnet_connections_.empty()) {
-      return;
+    size_t idx = static_cast<size_t>(call_id - self->machnet_base_call_id_start_);
+    if (idx < self->machnet_send_ts_by_index_.size()) {
+      self->machnet_send_ts_by_index_[idx] = now;
     }
 
-    size_t num_conns = self->machnet_connections_.size();
-
-    // Calculate total allowed inflight
-    size_t total_allowed_inflight = 0;
-    if (self->inflight_limit_ > 0) {
-      total_allowed_inflight = static_cast<size_t>(self->inflight_limit_) * num_conns;
-    } else {
-      // Unlimited mode: use default per-connection limit
-      total_allowed_inflight = num_conns * 256;
-    }
-
-    if (current_inflight >= total_allowed_inflight) {
-      return;  // At capacity
-    }
-
-    // Calculate how many we can send
-    size_t capacity_left = total_allowed_inflight - static_cast<size_t>(current_inflight);
-
-    // Apply rate limiting if configured
-    if (self->target_rps_ > 0) {
-      uint32_t sent_so_far = self->machnet_sent_in_window_.load(std::memory_order_acquire);
-      if (sent_so_far >= static_cast<uint32_t>(self->target_rps_)) {
-        return;  // Rate limit reached for this window
-      }
-
-      // Calculate tokens available based on elapsed time (token bucket)
-      uint64_t tokens_available = (static_cast<uint64_t>(self->target_rps_) *
-                                   static_cast<uint64_t>(elapsed_us)) / 1000000ULL;
-      if (tokens_available <= sent_so_far) {
-        return;  // Not enough tokens yet
-      }
-
-      size_t rate_capacity = tokens_available - sent_so_far;
-      capacity_left = std::min(capacity_left, rate_capacity);
-    }
-
-    // Batch send: send up to capacity_left requests
-    // Use round-robin across connections for load balancing
-    size_t sent_count = 0;
-    size_t rr_start = self->machnet_rr_next_;
-
-    for (size_t i = 0; i < capacity_left; i++) {
-      size_t conn_idx = (rr_start + i) % num_conns;
-      machnet::MachnetConnection *conn = self->machnet_connections_[conn_idx];
-
-      // Check per-connection inflight limit
-      size_t per_conn_inflight = (conn_idx < self->machnet_inflight_per_conn_.size())
-                                   ? self->machnet_inflight_per_conn_[conn_idx] : 0;
-      size_t per_conn_limit = (conn_idx < self->machnet_per_conn_limit_.size())
-                                ? self->machnet_per_conn_limit_[conn_idx] : 256;
-
-      if (per_conn_inflight >= per_conn_limit) {
-        continue;  // This connection is saturated, try next
-      }
-
-      // Create and send the request
-      uint16_t client_id = 0;
-      uint32_t call_id = self->next_call_id_.fetch_add(1, std::memory_order_relaxed);
-      protocol::FuncCall func_call = protocol::NewFuncCall(self->func_id_, client_id, call_id);
-      if (self->method_id_ > 0) {
-        func_call.method_id = self->method_id_;
-      }
-
-      protocol::GatewayMessage message = protocol::NewDispatchFuncCallGatewayMessage(func_call);
-      message.payload_size = self->input_size_;
-
-      // Send via Machnet
-      bool success = conn->SendMessage(
-          message,
-          std::span<const char>(self->machnet_input_buffer_.data(),
-                                self->machnet_input_buffer_.size()));
-
-      if (success) {
-        // Track inflight
-        static std::unique_ptr<EngineConnection> stats_tracker;
-        if (!stats_tracker) {
-          stats_tracker = std::make_unique<EngineConnection>(
-              &self->next_call_id_, 0, 0, self->func_id_, self->method_id_,
-              self->input_size_, self->target_rps_, self->inflight_limit_);
-        }
-
-        RegisterInflight(func_call.full_call_id, stats_tracker.get(), now, 0);
-
-        // Update counters (inflight tracking)
-        self->machnet_inflight_count_.fetch_add(1, std::memory_order_acq_rel);
-        if (conn_idx < self->machnet_inflight_per_conn_.size()) {
-          self->machnet_inflight_per_conn_[conn_idx]++;
-        }
-
-        // Update rate limiting counter
-        self->machnet_sent_in_window_.fetch_add(1, std::memory_order_acq_rel);
-        sent_count++;
-      }
-    }
-
-    // Advance round-robin pointer
-    if (sent_count > 0) {
-      self->machnet_rr_next_ = (rr_start + sent_count) % num_conns;
-
-      // Update stats (batch update at the end)
+    bool success = self->machnet_single_conn_->SendMessage(
+        message,
+        std::span<const char>(self->machnet_input_buffer_.data(),
+                              self->machnet_input_buffer_.size()));
+    if (success) {
       std::lock_guard<std::mutex> stats_lk(self->machnet_stats_mu_);
-      self->machnet_stats_.sent_count += sent_count;
+      self->machnet_stats_.sent_count++;
     }
+
+    // Advance schedule; if behind, catch up the schedule only
+    int64_t delta = now - self->machnet_next_send_time_;
+    int64_t intervals = 1 + (delta >= 0 ? (delta / self->machnet_inter_send_us_) : 0);
+    if (intervals < 1) intervals = 1;
+    self->machnet_next_send_time_ += intervals * self->machnet_inter_send_us_;
   }
 };
 

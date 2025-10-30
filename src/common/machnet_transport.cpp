@@ -83,6 +83,12 @@ void MachnetChannel::Poll() {
     }
 }
 
+void MachnetChannel::TryPoll() {
+    for (auto* listener : listeners_) {
+        listener->TryPoll();
+    }
+}
+
 void MachnetChannel::RegisterListener(MachnetListener* listener) {
     listeners_.push_back(listener);
 }
@@ -114,6 +120,53 @@ MachnetListener::MachnetListener(void* channel, const std::string& local_ip, uin
 
 MachnetListener::~MachnetListener() {
     MachnetChannel::Get()->UnregisterListener(this);
+}
+
+void MachnetListener::TryPoll() {
+    constexpr size_t kBufferSize = 65536;
+    static char buffer[kBufferSize];
+    MachnetFlow_t flow;
+    ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
+    if (ret <= 0) {
+        // ret == 0: no data; ret < 0: error
+        if (ret < 0) {
+            VLOG(1) << "machnet_recv() returned error: " << ret;
+        }
+        return;
+    }
+
+    VLOG(1) << fmt::format("Listener TryPoll received {} bytes from flow {}:{} -> {}:{}",
+                            ret, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
+
+    uint64_t flow_id = ((uint64_t)flow.src_ip << 32) |
+                      ((uint64_t)flow.src_port << 16) | flow.dst_port;
+
+    MachnetConnection* conn = nullptr;
+    auto it = connections_.find(flow_id);
+
+    if (it == connections_.end()) {
+        // New connection from a remote peer; swap for sending
+        MachnetFlow_t send_flow;
+        send_flow.src_ip = flow.dst_ip;
+        send_flow.src_port = flow.dst_port;
+        send_flow.dst_ip = flow.src_ip;
+        send_flow.dst_port = flow.src_port;
+
+        auto new_conn = std::make_unique<MachnetConnection>(channel_, send_flow);
+        conn = new_conn.get();
+        connections_[flow_id] = std::move(new_conn);
+
+        if (new_connection_callback_) {
+            new_connection_callback_(conn);
+        }
+    } else {
+        conn = it->second.get();
+    }
+
+    if (conn) {
+        conn->read_buffer_.AppendData(buffer, ret);
+        conn->ProcessMessages();
+    }
 }
 
 void MachnetListener::Poll() {
