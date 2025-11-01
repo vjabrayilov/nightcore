@@ -28,24 +28,23 @@ bool MachnetChannel::Init() {
 
     int ret = machnet_init();
     if (ret != 0) {
-        LOG(ERROR) << "machnet_init() failed with error: " << ret;
+        fprintf(stderr, "ERROR: machnet_init() failed with error: %d\n", ret);
         return false;
     }
 
     channel_ = machnet_attach();
     if (channel_ == nullptr) {
-        LOG(ERROR) << "machnet_attach() failed";
+        fprintf(stderr, "ERROR: machnet_attach() failed\n");
         return false;
     }
 
-    LOG(INFO) << "Machnet channel initialized successfully";
     return true;
 }
 
 std::unique_ptr<MachnetListener> MachnetChannel::CreateListener(const std::string& local_ip,
                                                                 uint16_t port) {
     if (channel_ == nullptr) {
-        LOG(ERROR) << "Machnet channel not initialized";
+        fprintf(stderr, "ERROR: Machnet channel not initialized\n");
         return nullptr;
     }
 
@@ -58,7 +57,7 @@ std::unique_ptr<MachnetListener> MachnetChannel::CreateListener(const std::strin
 std::unique_ptr<MachnetConnection> MachnetChannel::CreateConnection(
     const std::string& local_ip, const std::string& remote_ip, uint16_t remote_port) {
     if (channel_ == nullptr) {
-        LOG(ERROR) << "Machnet channel not initialized";
+        fprintf(stderr, "ERROR: Machnet channel not initialized\n");
         return nullptr;
     }
 
@@ -66,7 +65,7 @@ std::unique_ptr<MachnetConnection> MachnetChannel::CreateConnection(
     int ret = machnet_connect(channel_, local_ip.c_str(), remote_ip.c_str(),
                              remote_port, &flow);
     if (ret != 0) {
-        LOG(ERROR) << "machnet_connect() failed with error: " << ret;
+        fprintf(stderr, "ERROR: machnet_connect() failed with error: %d\n", ret);
         return nullptr;
     }
 
@@ -108,11 +107,10 @@ MachnetListener::MachnetListener(void* channel, const std::string& local_ip, uin
 
     int ret = machnet_listen(channel_, local_ip.c_str(), port);
     if (ret != 0) {
-        LOG(FATAL) << "machnet_listen() failed on " << local_ip << ":" << port
-                   << " with error: " << ret;
+        fprintf(stderr, "FATAL: machnet_listen() failed on %s:%d with error: %d\n",
+                local_ip.c_str(), port, ret);
+        abort();
     }
-
-    LOG(INFO) << "Machnet listening on " << local_ip << ":" << port;
 
     // Register with the channel for polling
     MachnetChannel::Get()->RegisterListener(this);
@@ -128,15 +126,9 @@ void MachnetListener::TryPoll() {
     MachnetFlow_t flow;
     ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
     if (ret <= 0) {
-        // ret == 0: no data; ret < 0: error
-        if (ret < 0) {
-            VLOG(1) << "machnet_recv() returned error: " << ret;
-        }
+        // ret == 0: no data; ret < 0: error (silently ignore)
         return;
     }
-
-    VLOG(1) << fmt::format("Listener TryPoll received {} bytes from flow {}:{} -> {}:{}",
-                            ret, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
 
     uint64_t flow_id = ((uint64_t)flow.src_ip << 32) |
                       ((uint64_t)flow.src_port << 16) | flow.dst_port;
@@ -178,15 +170,9 @@ void MachnetListener::Poll() {
         MachnetFlow_t flow;
         ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
         if (ret <= 0) {
-            // ret == 0: no data; ret < 0: error
-            if (ret < 0) {
-                VLOG(1) << "machnet_recv() returned error: " << ret;
-            }
+            // ret == 0: no data; ret < 0: error (silently ignore)
             break;
         }
-
-        VLOG(1) << fmt::format("Listener received {} bytes from flow {}:{} -> {}:{}",
-                                ret, flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port);
 
         uint64_t flow_id = ((uint64_t)flow.src_ip << 32) |
                           ((uint64_t)flow.src_port << 16) | flow.dst_port;
@@ -226,28 +212,26 @@ void MachnetListener::Poll() {
 
 MachnetConnection::MachnetConnection(void* channel, const MachnetFlow_t& flow)
     : channel_(channel), flow_(flow) {
-    LOG(INFO) << fmt::format("Machnet connection created: {}:{} -> {}:{} (channel={:p})",
-                            flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port, channel);
+    // LOG(INFO) << fmt::format("Machnet connection created: {}:{} -> {}:{} (channel={:p})",
+    //                         flow.src_ip, flow.src_port, flow.dst_ip, flow.dst_port, channel);
 }
 
 MachnetConnection::~MachnetConnection() {
-    LOG(INFO) << fmt::format("Machnet connection destroyed: {}:{} -> {}:{}",
-                            flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port);
+    // LOG(INFO) << fmt::format("Machnet connection destroyed: {}:{} -> {}:{}",
+    //                         flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port);
 }
 
 bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
                                     std::span<const char> payload) {
-    DCHECK_EQ(message.payload_size, gsl::narrow_cast<int32_t>(payload.size()));
-
-    VLOG(1) << fmt::format("SendMessage: using flow {}:{} -> {}:{}, channel={:p}",
-                            flow_.src_ip, flow_.src_port, flow_.dst_ip, flow_.dst_port, channel_);
+    // Note: DCHECK removed - not safe on non-Nightcore threads
+    // assert(message.payload_size == static_cast<int32_t>(payload.size()));
 
     // Optimize: send header+payload in one call to reduce overhead
     if (payload.empty()) {
         // No payload - send header only
         int ret = machnet_send(channel_, flow_, &message, sizeof(protocol::GatewayMessage));
         if (ret != 0) {
-            LOG(ERROR) << "machnet_send() failed for header with error: " << ret;
+            // Silently fail - logging not safe on this thread
             return false;
         }
     } else {
@@ -264,7 +248,6 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
 
             int ret = machnet_send(channel_, flow_, stack_buffer, total_size);
             if (ret != 0) {
-                LOG(ERROR) << "machnet_send() failed with error: " << ret;
                 return false;
             }
         } else {
@@ -275,7 +258,6 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
 
             int ret = machnet_send(channel_, flow_, buffer.data(), total_size);
             if (ret != 0) {
-                LOG(ERROR) << "machnet_send() failed with error: " << ret;
                 return false;
             }
         }
@@ -292,13 +274,9 @@ void MachnetConnection::Poll() {
         MachnetFlow_t recv_flow;
         ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &recv_flow);
         if (ret <= 0) {
-            if (ret < 0) {
-                VLOG(1) << fmt::format("machnet_recv() error: {}", ret);
-            }
+            // Silently ignore errors
             break;
         }
-        VLOG(1) << fmt::format("Machnet received {} bytes from flow {}:{} -> {}:{}",
-                                ret, recv_flow.src_ip, recv_flow.src_port, recv_flow.dst_ip, recv_flow.dst_port);
         read_buffer_.AppendData(buffer, ret);
         ProcessMessages();
     }
@@ -319,18 +297,14 @@ void MachnetConnection::ProcessMessages() {
                 read_buffer_.data() + sizeof(protocol::GatewayMessage),
                 full_size - sizeof(protocol::GatewayMessage));
 
-            VLOG(1) << fmt::format("Machnet message complete: header + {} bytes payload", payload.size());
             if (message_callback_) {
                 message_callback_(*message, payload);
-            } else {
-                LOG(WARNING) << "No message callback set!";
             }
+            // Silently ignore if no callback set
 
             read_buffer_.ConsumeFront(full_size);
         } else {
             // Incomplete message, wait for more data
-            VLOG(1) << fmt::format("Incomplete message: have {}, need {} bytes",
-                                   read_buffer_.length(), full_size);
             break;
         }
     }

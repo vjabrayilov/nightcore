@@ -1,6 +1,5 @@
 #pragma once
 
-#include "base/common.h"
 #include "common/protocol.h"
 #include "utils/appendable_buffer.h"
 
@@ -9,6 +8,13 @@
 #include <functional>
 #include <memory>
 #include <unordered_map>
+
+// IMPORTANT: Thread Safety Note
+// ==============================
+// This Machnet transport layer is designed to be used from non-Nightcore threads
+// (e.g., raw std::thread). The implementation MUST NOT use LOG/VLOG/DCHECK macros
+// because they rely on base::Thread::current() which is only valid for threads
+// registered with Nightcore's thread system. Use fprintf(stderr) for critical errors.
 
 namespace faas {
 namespace machnet {
