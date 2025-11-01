@@ -394,7 +394,7 @@ $NIGHTCORE_ROOT/bin/$BUILD_TYPE/launcher \
     --fprocess_mode=cpp \
     --fprocess_output_dir=$BASE_DIR/outputs \
     --fprocess="$NIGHTCORE_ROOT/bin/$BUILD_TYPE/func_worker_v1 $LIB_PATH" \
-    --v=0 > /dev/null 2>&1 &
+    --v=0 > $BASE_DIR/outputs/launcher.log 2>&1 &
 LAUNCHER_PID=$!
 
 echo "All components started. Stress test will begin after warmup..."
@@ -438,7 +438,9 @@ if [ "$REMOTE_STRESS_CLIENT" = "true" ]; then
 fi
 
 echo ""
-echo "NOTE: Engine and Launcher logs suppressed (2>/dev/null)"
-echo "Worker output: $BASE_DIR/outputs/${FUNC_NAME}_worker_*.stdout"
+echo "Logs saved to:"
+echo "  Engine:   $BASE_DIR/outputs/engine.log"
+echo "  Launcher: $BASE_DIR/outputs/launcher.log"
+echo "  Workers:  $BASE_DIR/outputs/${FUNC_NAME}_worker_*.stdout"
 
 exit $BENCH_EXIT_CODE
