@@ -56,7 +56,7 @@ void MachnetStressTransport::Stop() {
     receive_thread_.join();
   }
 
-  machnet_single_conn_ = nullptr;
+  machnet_single_conn_.store(nullptr, std::memory_order_relaxed);
   machnet_listener_.reset();
 }
 
@@ -109,11 +109,11 @@ ConnectionStats MachnetStressTransport::GetStats() const {
 }
 
 size_t MachnetStressTransport::GetConnectionCount() const {
-  return machnet_single_conn_ != nullptr ? 1 : 0;
+  return machnet_single_conn_.load(std::memory_order_acquire) != nullptr ? 1 : 0;
 }
 
 bool MachnetStressTransport::HasConnections() const {
-  return machnet_single_conn_ != nullptr;
+  return machnet_single_conn_.load(std::memory_order_acquire) != nullptr;
 }
 
 void MachnetStressTransport::OnNewMachnetConnection(
@@ -132,8 +132,26 @@ void MachnetStressTransport::OnRecvMachnetEngineMessage(
     std::span<const char> payload) {
   // Handle handshake - single connection
   if (IsEngineHandshakeMessage(message)) {
-    // No logging - called from Machnet receive thread
-    machnet_single_conn_ = connection;
+    // Pin the sending connection on first handshake; ignore subsequent ones
+    machnet::MachnetConnection* expected = nullptr;
+    if (machnet_single_conn_.compare_exchange_strong(
+            expected, connection, std::memory_order_acq_rel)) {
+      const auto& f = connection->flow();
+      std::cerr << "[Receive Thread " << std::this_thread::get_id()
+                << "] Handshake: pinned send flow "
+                << f.src_ip << ":" << f.src_port << " -> "
+                << f.dst_ip << ":" << f.dst_port << std::endl;
+    } else {
+      const auto& f_new = connection->flow();
+      const auto& f_old = expected->flow();
+      std::cerr << "[Receive Thread " << std::this_thread::get_id()
+                << "] Handshake: ignoring new flow "
+                << f_new.src_ip << ":" << f_new.src_port << " -> "
+                << f_new.dst_ip << ":" << f_new.dst_port
+                << "; already pinned to "
+                << f_old.src_ip << ":" << f_old.src_port << " -> "
+                << f_old.dst_ip << ":" << f_old.dst_port << std::endl;
+    }
     return;
   }
 
@@ -167,15 +185,27 @@ void MachnetStressTransport::SendThreadMain() {
   std::cerr << "[Send Thread " << std::this_thread::get_id()
             << "] Machnet send thread started" << std::endl;
 
+  machnet::MachnetConnection* last_conn = nullptr;
+
   while (!should_stop_.load(std::memory_order_acquire)) {
     if (!sending_enabled_.load(std::memory_order_acquire)) {
       std::this_thread::sleep_for(std::chrono::microseconds(100));
       continue;
     }
 
-    if (machnet_single_conn_ == nullptr) {
+    machnet::MachnetConnection* conn = machnet_single_conn_.load(std::memory_order_acquire);
+    if (conn == nullptr) {
       std::this_thread::sleep_for(std::chrono::microseconds(100));
       continue;
+    }
+
+    if (conn != last_conn) {
+      const auto& f = conn->flow();
+      std::cerr << "[Send Thread " << std::this_thread::get_id()
+                << "] Now sending on flow "
+                << f.src_ip << ":" << f.src_port << " -> "
+                << f.dst_ip << ":" << f.dst_port << std::endl;
+      last_conn = conn;
     }
 
     uint64_t now = uv_hrtime() / 1000; // convert ns -> us
@@ -205,7 +235,7 @@ void MachnetStressTransport::SendThreadMain() {
       send_ts_by_index_[idx] = now;
     }
 
-    bool success = machnet_single_conn_->SendMessage(message, {});
+    bool success = conn->SendMessage(message, {});
         // message, std::span<const char>(input_buffer_.data(), input_buffer_.size()));
     if (success) {
       sent_count_.fetch_add(1, std::memory_order_relaxed);

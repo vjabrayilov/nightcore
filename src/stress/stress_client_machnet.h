@@ -37,7 +37,7 @@ private:
 
   // Machnet support
   std::unique_ptr<machnet::MachnetListener> machnet_listener_;
-  machnet::MachnetConnection* machnet_single_conn_{nullptr};
+  std::atomic<machnet::MachnetConnection*> machnet_single_conn_{nullptr};
 
   // Machnet stress test state - lock-free counters
   std::atomic<uint64_t> sent_count_{0};
