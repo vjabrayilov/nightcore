@@ -61,17 +61,15 @@ private:
   std::vector<int64_t> send_ts_by_index_;
   std::string input_buffer_;
 
-  // Dedicated send and receive threads
-  std::thread send_thread_;
-  std::thread receive_thread_;
+  // Single event-loop thread
+  std::thread loop_thread_;
 
   void OnNewMachnetConnection(machnet::MachnetConnection* connection);
   void OnRecvMachnetEngineMessage(machnet::MachnetConnection* connection,
                                    const protocol::GatewayMessage& message,
                                    std::span<const char> payload);
 
-  void SendThreadMain();
-  void ReceiveThreadMain();
+  void LoopThreadMain();
 };
 
 } // namespace stress

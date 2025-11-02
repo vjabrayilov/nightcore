@@ -32,28 +32,19 @@ MachnetStressTransport::~MachnetStressTransport() { Stop(); }
 
 void MachnetStressTransport::Start() {
   CHECK(!machnet_ip_.empty()) << "machnet_ip must be set";
-
-  // Start receive thread which will initialize Machnet
-  LOG(INFO) << "Starting Machnet receive thread...";
-  receive_thread_ = std::thread(&MachnetStressTransport::ReceiveThreadMain, this);
-
-  // Wait a moment for Machnet to initialize in the receive thread
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  LOG(INFO) << "Listening on Machnet " << machnet_ip_ << ":" << listen_port_
-            << " for Engine connections";
+  // Start single event-loop thread which initializes Machnet, accepts handshake,
+  // generates load and polls for responses.
+  LOG(INFO) << "Starting Machnet event-loop thread...";
+  loop_thread_ = std::thread(&MachnetStressTransport::LoopThreadMain, this);
 }
 
 void MachnetStressTransport::Stop() {
   should_stop_.store(true);
   sending_enabled_.store(false);
 
-  // Join Machnet threads if they exist
-  if (send_thread_.joinable()) {
-    send_thread_.join();
-  }
-  if (receive_thread_.joinable()) {
-    receive_thread_.join();
+  // Join event-loop thread if it exists
+  if (loop_thread_.joinable()) {
+    loop_thread_.join();
   }
 
   machnet_single_conn_.store(nullptr, std::memory_order_relaxed);
@@ -79,11 +70,7 @@ void MachnetStressTransport::EnableSending() {
     latencies_us_.reserve(expected_requests);
   }
 
-  // Start send thread (receive thread already started in Start())
-  LOG(INFO) << "Starting Machnet send thread...";
-  send_thread_ = std::thread(&MachnetStressTransport::SendThreadMain, this);
-
-  // Enable sending (threads will handle send/poll)
+  // Enable sending (event-loop thread will handle send/poll)
   sending_enabled_.store(true, std::memory_order_release);
 }
 
@@ -181,45 +168,73 @@ void MachnetStressTransport::OnRecvMachnetEngineMessage(
   }
 }
 
-void MachnetStressTransport::SendThreadMain() {
-  std::cerr << "[Send Thread " << std::this_thread::get_id()
-            << "] Machnet send thread started" << std::endl;
+void MachnetStressTransport::LoopThreadMain() {
+  // Initialize Machnet and create listener on this thread
+  std::cerr << "[Loop Thread " << std::this_thread::get_id()
+            << "] Machnet event-loop thread started" << std::endl;
+  auto* chan = machnet::MachnetChannel::Get();
+  if (!chan->Init()) {
+    std::cerr << "[Loop Thread " << std::this_thread::get_id()
+              << "] Failed to initialize Machnet" << std::endl;
+    return;
+  }
+
+  machnet_listener_ = chan->CreateListener(machnet_ip_, listen_port_);
+  if (machnet_listener_ == nullptr) {
+    std::cerr << "[Loop Thread " << std::this_thread::get_id()
+              << "] Failed to create Machnet listener" << std::endl;
+    return;
+  }
+  std::cerr << "Listening on Machnet " << machnet_ip_ << ":" << listen_port_
+            << " for Engine connections";
+  std::cerr << "[Loop Thread " << std::this_thread::get_id()
+            << "] Machnet listener created" << std::endl;
+
+  // Enforce single-connection behavior: after first flow, ignore any new ones
+  machnet_listener_->SetSingleConnectionOnly(true);
+  machnet_listener_->SetNewConnectionCallback(
+      [this](machnet::MachnetConnection* conn) { OnNewMachnetConnection(conn); });
 
   machnet::MachnetConnection* last_conn = nullptr;
 
   while (!should_stop_.load(std::memory_order_acquire)) {
-    if (!sending_enabled_.load(std::memory_order_acquire)) {
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
-      continue;
-    }
+    // Always poll first to prioritize handshake and response processing
+    chan->Poll();
 
-    machnet::MachnetConnection* conn = machnet_single_conn_.load(std::memory_order_acquire);
+    // Wait for handshake to pin the single connection
+    machnet::MachnetConnection* conn =
+        machnet_single_conn_.load(std::memory_order_acquire);
     if (conn == nullptr) {
-      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
       continue;
     }
 
     if (conn != last_conn) {
       const auto& f = conn->flow();
-      std::cerr << "[Send Thread " << std::this_thread::get_id()
+      std::cerr << "[Loop Thread " << std::this_thread::get_id()
                 << "] Now sending on flow "
                 << f.src_ip << ":" << f.src_port << " -> "
                 << f.dst_ip << ":" << f.dst_port << std::endl;
       last_conn = conn;
     }
 
-    uint64_t now = uv_hrtime() / 1000; // convert ns -> us
-    if (now >= test_end_time_) {
-      break; // Test duration elapsed
-    }
-
-    if (now < next_send_time_) {
-      // Not time to send yet - yield CPU briefly
-      // std::this_thread::yield();
+    if (!sending_enabled_.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
       continue;
     }
 
-    // Send exactly one request (open-loop pacing)
+    uint64_t now = uv_hrtime() / 1000; // convert ns -> us
+    if (now >= test_end_time_) {
+      sending_enabled_.store(false, std::memory_order_release);
+      std::this_thread::sleep_for(std::chrono::microseconds(100));
+      continue;
+    }
+
+    if (now < next_send_time_) {
+      chan->Poll();
+      continue;
+    }
+
     uint16_t client_id = 0;
     uint32_t call_id = call_id_alloc_->fetch_add(1, std::memory_order_relaxed);
     FuncCall func_call = NewFuncCall(config_.func_id, client_id, call_id);
@@ -227,66 +242,28 @@ void MachnetStressTransport::SendThreadMain() {
       func_call.method_id = config_.method_id;
     }
     GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
-    // message.payload_size = config_.input_size;
 
-    // Record send timestamp for latency calculation
     size_t idx = static_cast<size_t>(call_id - base_call_id_start_);
     if (idx < send_ts_by_index_.size()) {
       send_ts_by_index_[idx] = now;
     }
 
     bool success = conn->SendMessage(message, {});
-        // message, std::span<const char>(input_buffer_.data(), input_buffer_.size()));
     if (success) {
       sent_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
-    // Advance schedule (open-loop pacing)
-    int64_t delta = now - next_send_time_;
-    int64_t intervals = 1 + (delta >= 0 ? (delta / inter_send_us_) : 0);
-    if (intervals < 1)
-      intervals = 1;
-    next_send_time_ += intervals * inter_send_us_;
+    // Advance schedule (open-loop pacing with catch-up)
+    int64_t delta = (int64_t)now - (int64_t)next_send_time_;
+    int64_t intervals = 1 + (delta >= 0 ? (delta / (int64_t)inter_send_us_) : 0);
+    if (intervals < 1) intervals = 1;
+    next_send_time_ += (uint64_t)intervals * inter_send_us_;
+
+    chan->Poll();
   }
 
-  std::cerr << "[Send Thread " << std::this_thread::get_id()
-            << "] Machnet send thread finished" << std::endl;
-}
-
-void MachnetStressTransport::ReceiveThreadMain() {
-  // Initialize Machnet on THIS thread
-  std::cerr << "[Receive Thread " << std::this_thread::get_id()
-            << "] Machnet receive thread started" << std::endl;
-  auto* machnet_channel = machnet::MachnetChannel::Get();
-  if (!machnet_channel->Init()) {
-    std::cerr << "[Receive Thread " << std::this_thread::get_id()
-              << "] Failed to initialize Machnet" << std::endl;
-    return;
-  }
-
-  // Create Machnet listener on THIS thread
-  machnet_listener_ = machnet_channel->CreateListener(machnet_ip_, listen_port_);
-  if (machnet_listener_ == nullptr) {
-    std::cerr << "[Receive Thread " << std::this_thread::get_id()
-              << "] Failed to create Machnet listener" << std::endl;
-    return;
-  }
-  std::cerr << "[Receive Thread " << std::this_thread::get_id()
-            << "] Machnet listener created" << std::endl;
-
-  // Enforce single-connection behavior: after first flow, ignore any new ones
-  machnet_listener_->SetSingleConnectionOnly(true);
-
-  machnet_listener_->SetNewConnectionCallback(
-      [this](machnet::MachnetConnection* conn) {
-        OnNewMachnetConnection(conn);
-      });
-
-  while (!should_stop_.load(std::memory_order_acquire)) {
-    machnet::MachnetChannel::Get()->Poll();
-  }
-  std::cerr << "[Receive Thread " << std::this_thread::get_id()
-            << "] Machnet receive thread finished" << std::endl;
+  std::cerr << "[Loop Thread " << std::this_thread::get_id()
+            << "] Machnet event-loop thread finished" << std::endl;
 }
 
 // Factory function implementation
