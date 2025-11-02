@@ -4,7 +4,10 @@
 #include "ipc/shm_region.h"
 #include "common/time.h"
 #include "utils/fs.h"
-#include "utils/io.h"
+#include "common/machnet_transport.h"
+
+#include <machnet.h>
+#include <atomic>
 #include "utils/docker.h"
 #include "utils/socket.h"
 #include "worker/worker_lib.h"
@@ -22,7 +25,6 @@ namespace faas {
 namespace engine {
 
 using protocol::FuncCall;
-using protocol::FuncCallDebugString;
 using protocol::Message;
 using protocol::GatewayMessage;
 using protocol::GetFuncCallFromMessage;
@@ -34,10 +36,27 @@ using protocol::IsFuncCallCompleteMessage;
 using protocol::IsFuncCallFailedMessage;
 using protocol::IsDispatchFuncCallMessage;
 using protocol::NewHandshakeResponseMessage;
-using protocol::NewEngineHandshakeGatewayMessage;
 using protocol::NewFuncCallCompleteGatewayMessage;
 using protocol::NewFuncCallFailedGatewayMessage;
 using protocol::ComputeMessageDelay;
+
+namespace {
+// Map each IO worker to its dedicated Machnet connection for routing and polling
+absl::flat_hash_map<server::IOWorker*, machnet::MachnetConnection*>
+    g_worker_to_machnet_conn;
+
+// Separate Machnet channel per IO worker and poller threads state
+std::vector<void*> g_machnet_channels;
+std::atomic<bool> g_machnet_inited(false);
+
+// Idle callback that polls the associated Machnet connection
+void MachnetPerWorkerPollIdleCb(uv_idle_t* handle) {
+    auto* conn = reinterpret_cast<machnet::MachnetConnection*>(handle->data);
+    if (conn != nullptr) {
+        conn->Poll();
+    }
+}
+}
 
 Engine::Engine()
     : gateway_port_(-1),
@@ -102,34 +121,61 @@ void Engine::StartInternal() {
         CHECK(!machnet_ip_.empty()) << "machnet_ip must be set when use_machnet=true";
         CHECK(!gateway_machnet_ip_.empty()) << "gateway_machnet_ip must be set when use_machnet=true";
 
-        // Initialize Machnet channel
-        auto* machnet_channel = machnet::MachnetChannel::Get();
-        CHECK(machnet_channel->Init()) << "Failed to initialize Machnet";
+        // Initialize Machnet once per process
+        if (!g_machnet_inited.load(std::memory_order_acquire)) {
+            int ret = machnet_init();
+            CHECK(ret == 0) << "Failed to initialize Machnet: machnet_init()";
+            g_machnet_inited.store(true, std::memory_order_release);
+        }
 
-        // Create connections to Gateway
-        int total_gateway_conn = num_io_workers_ * gateway_conn_per_worker_;
+        // Create exactly one Machnet connection per IO worker, each on its own channel
+        int total_gateway_conn = num_io_workers_;
+        machnet_connections_.clear();
+        machnet_connections_.reserve(total_gateway_conn);
+        g_machnet_channels.clear();
+        g_machnet_channels.reserve(total_gateway_conn);
         for (int i = 0; i < total_gateway_conn; i++) {
-            auto conn = machnet_channel->CreateConnection(
-                machnet_ip_, gateway_machnet_ip_, gateway_port_);
-            CHECK(conn != nullptr) << "Failed to create Machnet connection to Gateway";
+            void* worker_channel = machnet_attach();
+            CHECK(worker_channel != nullptr) << "machnet_attach() failed for IO worker";
+            g_machnet_channels.push_back(worker_channel);
 
+            MachnetFlow_t flow;
+            int ret = machnet_connect(worker_channel, machnet_ip_.c_str(),
+                                      gateway_machnet_ip_.c_str(), gateway_port_, &flow);
+            CHECK(ret == 0) << "machnet_connect() failed for IO worker";
+
+            auto conn = std::unique_ptr<machnet::MachnetConnection>(
+                new machnet::MachnetConnection(worker_channel, flow));
+
+            // Route message handling directly (Machnet receive thread-safe path)
             conn->SetMessageCallback(
                 [this](const GatewayMessage& msg, std::span<const char> payload) {
                     OnRecvMachnetGatewayMessage(msg, payload);
                 });
 
-            // Send handshake to Gateway
+            // Send handshake to Gateway (conn_id == IO worker index)
             GatewayMessage handshake = protocol::NewEngineHandshakeGatewayMessage(node_id_, i);
             conn->SendMessage(handshake, std::span<const char>());
 
             machnet_connections_.push_back(std::move(conn));
         }
 
-        // Setup idle callback for continuous aggressive polling (keeps event loop active)
-        UV_CHECK_OK(uv_idle_init(uv_loop(), &machnet_poll_idle_));
-        machnet_poll_idle_.data = this;
-        UV_CHECK_OK(uv_idle_start(&machnet_poll_idle_, &Engine::MachnetPollCallback));
-        HLOG(INFO) << "Started Machnet continuous polling (uv_idle)";
+        // Register per-worker routing map and attach per-worker uv_idle pollers
+        DCHECK_EQ(static_cast<size_t>(total_gateway_conn), io_workers_.size());
+        g_worker_to_machnet_conn.clear();
+        for (int i = 0; i < total_gateway_conn; i++) {
+            server::IOWorker* io_worker = io_workers_[i];
+            machnet::MachnetConnection* conn_ptr = machnet_connections_[i].get();
+            g_worker_to_machnet_conn[io_worker] = conn_ptr;
+        }
+        // Create per-worker idle handles that poll their Machnet connection
+        machnet_poll_idles_.clear();
+        machnet_poll_idles_.resize(total_gateway_conn);
+        for (int i = 0; i < total_gateway_conn; i++) {
+            server::IOWorker* io_worker = io_workers_[i];
+            machnet::MachnetConnection* conn_ptr = machnet_connections_[i].get();
+            io_worker->StartIdle(&machnet_poll_idles_[i], &MachnetPerWorkerPollIdleCb, conn_ptr);
+        }
 
         HLOG(INFO) << fmt::format("Created {} Machnet connections to Gateway at {}:{}",
                                   total_gateway_conn, gateway_machnet_ip_, gateway_port_);
@@ -178,6 +224,21 @@ void Engine::StartInternal() {
 
 void Engine::StopInternal() {
     uv_close(UV_AS_HANDLE(uv_handle_), nullptr);
+    if (use_machnet_) {
+        // Stop per-worker idle pollers and clean resources
+        if (machnet_poll_idles_.size() == io_workers_.size()) {
+            for (size_t i = 0; i < io_workers_.size(); i++) {
+                io_workers_[i]->StopIdle(&machnet_poll_idles_[i]);
+            }
+        } else {
+            for (size_t i = 0; i < machnet_poll_idles_.size() && i < io_workers_.size(); i++) {
+                io_workers_[i]->StopIdle(&machnet_poll_idles_[i]);
+            }
+        }
+        machnet_poll_idles_.clear();
+        g_worker_to_machnet_conn.clear();
+        g_machnet_channels.clear();
+    }
 }
 
 void Engine::OnConnectionClose(server::ConnectionBase* connection) {
@@ -444,7 +505,17 @@ void Engine::ExternalFuncCallCompleted(const protocol::FuncCall& func_call,
 
     if (use_machnet_) {
         // Machnet mode
-        auto* machnet_conn = PickMachnetGatewayConnection();
+        machnet::MachnetConnection* machnet_conn = nullptr;
+        if (server::IOWorker::current() != nullptr) {
+            auto it = g_worker_to_machnet_conn.find(server::IOWorker::current());
+            if (it != g_worker_to_machnet_conn.end()) {
+                machnet_conn = it->second;
+            }
+        }
+        if (machnet_conn == nullptr && !machnet_connections_.empty()) {
+            // Fallback to first connection if not on an IO worker thread
+            machnet_conn = machnet_connections_[0].get();
+        }
         if (machnet_conn != nullptr) {
             machnet_conn->SendMessage(message, output);
         } else {
@@ -470,8 +541,19 @@ void Engine::ExternalFuncCallFailed(const protocol::FuncCall& func_call, int sta
 
     if (use_machnet_) {
         // Machnet mode
-        auto* machnet_conn = PickMachnetGatewayConnection();
+        machnet::MachnetConnection* machnet_conn = nullptr;
+        if (server::IOWorker::current() != nullptr) {
+            auto it = g_worker_to_machnet_conn.find(server::IOWorker::current());
+            if (it != g_worker_to_machnet_conn.end()) {
+                machnet_conn = it->second;
+            }
+        }
+        if (machnet_conn == nullptr && !machnet_connections_.empty()) {
+            // Fallback to first connection if not on an IO worker thread
+            machnet_conn = machnet_connections_[0].get();
+        }
         if (machnet_conn != nullptr) {
+            HLOG(WARNING) << fmt::format("Sending FuncCallFailed message to Machnet: {}", FuncCallDebugString(func_call));
             machnet_conn->SendMessage(message, std::span<const char>());
         } else {
             HLOG(ERROR) << "There is no Machnet gateway connection available";
@@ -542,7 +624,10 @@ void Engine::ProcessDiscardedFuncCallIfNecessary() {
         }
         discarded_func_calls_.clear();
     }
+    // Clean up tracer entries for discarded calls to prevent stale entries
     for (const FuncCall& func_call : discarded_external_func_calls) {
+        HLOG(WARNING) << fmt::format("Discarding external func_call: {}", FuncCallDebugString(func_call));
+        tracer_->DiscardFuncCallInfo(func_call);
         ExternalFuncCallFailed(func_call);
     }
     if (!discarded_internal_func_calls.empty()) {
@@ -624,7 +709,11 @@ void Engine::OnRecvMachnetGatewayMessage(const GatewayMessage& message,
                                   func_call.full_call_id, payload.size());
         OnExternalFuncCall(func_call, payload);
     } else {
-        HLOG(ERROR) << "Unknown Machnet gateway message type";
+        HLOG(WARNING) << fmt::format("Unknown Machnet gateway message type: "
+                                     "message_type={}, func_id={}, call_id={}, payload={} bytes",
+                                     static_cast<int>(message.message_type),
+                                     static_cast<uint16_t>(message.func_id),
+                                     message.call_id, payload.size());
     }
 }
 
@@ -635,35 +724,6 @@ machnet::MachnetConnection* Engine::PickMachnetGatewayConnection() {
     // Round-robin selection
     size_t idx = next_machnet_conn_idx_.fetch_add(1) % machnet_connections_.size();
     return machnet_connections_[idx].get();
-}
-
-void Engine::DoMachnetPoll() {
-    // Wrap in try-catch to ensure polling never crashes
-    try {
-        // Poll all Engine connections to Gateway
-        for (size_t i = 0; i < machnet_connections_.size(); i++) {
-            if (machnet_connections_[i] != nullptr) {
-                machnet_connections_[i]->Poll();
-            }
-        }
-        // Also poll the channel's listeners (Gateway has listeners, Engine doesn't)
-        machnet::MachnetChannel::Get()->Poll();
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Engine DoMachnetPoll: Exception caught: " << e.what();
-    } catch (...) {
-        LOG(ERROR) << "Engine DoMachnetPoll: Unknown exception caught!";
-    }
-}
-
-void Engine::MachnetPollCallback(uv_idle_t* handle) {
-    // Verify handle data is valid
-    if (handle == nullptr || handle->data == nullptr) {
-        LOG(ERROR) << "Engine MachnetPollCallback: Invalid handle or data pointer!";
-        return;
-    }
-
-    Engine* engine = reinterpret_cast<Engine*>(handle->data);
-    engine->DoMachnetPoll();
 }
 
 }  // namespace engine

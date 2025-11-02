@@ -53,8 +53,16 @@ Tracer::FuncCallInfo* Tracer::OnNewFuncCall(const FuncCall& func_call,
     {
         absl::MutexLock lk(&mu_);
         if (func_call_infos_.contains(func_call.full_call_id)) {
-            HLOG(WARNING) << "FuncCall already exists: " << FuncCallDebugString(func_call);
-            return nullptr;
+            // DEFENSIVE: Duplicate DISPATCH message received
+            // This can happen due to:
+            // 1. Machnet duplicate message delivery
+            // 2. Stress test retransmissions
+            // 3. Call ID reuse after restart
+            // Return the existing info instead of overwriting to maintain consistency
+            info = func_call_infos_[func_call.full_call_id];
+            HLOG(WARNING) << "OnNewFuncCall: FuncCall already exists (duplicate DISPATCH): " << FuncCallDebugString(func_call)
+                    << " - Returning existing entry";
+            return info;
         }
         info = func_call_info_pool_.Get();
         func_call_infos_[func_call.full_call_id] = info;
@@ -110,7 +118,7 @@ Tracer::FuncCallInfo* Tracer::OnFuncCallDispatched(const protocol::FuncCall& fun
     {
         absl::MutexLock lk(&mu_);
         if (!func_call_infos_.contains(func_call.full_call_id)) {
-            HLOG(WARNING) << "Cannot find FuncCall: " << FuncCallDebugString(func_call);
+            HLOG(WARNING) << "OnFuncCallDispatched: Cannot find FuncCall: " << FuncCallDebugString(func_call);
             return nullptr;
         }
         info = func_call_infos_[func_call.full_call_id];
@@ -146,7 +154,7 @@ Tracer::FuncCallInfo* Tracer::OnFuncCallCompleted(const FuncCall& func_call,
     {
         absl::MutexLock lk(&mu_);
         if (!func_call_infos_.contains(func_call.full_call_id)) {
-            HLOG(WARNING) << "Cannot find FuncCall: " << FuncCallDebugString(func_call);
+            HLOG(WARNING) << "OnFuncCallCompleted: Cannot find FuncCall: " << FuncCallDebugString(func_call);
             return nullptr;
         }
         info = func_call_infos_[func_call.full_call_id];
@@ -207,7 +215,7 @@ Tracer::FuncCallInfo* Tracer::OnFuncCallFailed(const FuncCall& func_call, int32_
     {
         absl::MutexLock lk(&mu_);
         if (!func_call_infos_.contains(func_call.full_call_id)) {
-            HLOG(WARNING) << "Cannot find FuncCall: " << FuncCallDebugString(func_call);
+            HLOG(WARNING) << "OnFuncCallFailed: Cannot find FuncCall: " << FuncCallDebugString(func_call);
             return nullptr;
         }
         info = func_call_infos_[func_call.full_call_id];
@@ -248,7 +256,7 @@ Tracer::FuncCallInfo* Tracer::OnFuncCallFailed(const FuncCall& func_call, int32_
 void Tracer::DiscardFuncCallInfo(const protocol::FuncCall& func_call) {
     absl::MutexLock lk(&mu_);
     if (!func_call_infos_.contains(func_call.full_call_id)) {
-        HLOG(WARNING) << "Cannot find FuncCall: " << FuncCallDebugString(func_call);
+        HLOG(WARNING) << "DiscardFuncCallInfo: Cannot find FuncCall: " << FuncCallDebugString(func_call);
         return;
     }
     func_call_infos_.erase(func_call.full_call_id);

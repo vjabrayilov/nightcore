@@ -1,6 +1,5 @@
 #include "engine/dispatcher.h"
 
-#include "ipc/base.h"
 #include "engine/engine.h"
 
 #include <absl/flags/flag.h>
@@ -23,7 +22,6 @@ using protocol::FuncCallDebugString;
 using protocol::Message;
 using protocol::SetInlineDataInMessage;
 using protocol::GetFuncCallFromMessage;
-using protocol::NewCreateFuncWorkerMessage;
 using protocol::NewDispatchFuncCallMessage;
 
 Dispatcher::Dispatcher(Engine* engine, uint16_t func_id)
@@ -89,6 +87,13 @@ bool Dispatcher::OnNewFuncCall(const FuncCall& func_call, const FuncCall& parent
                                bool shm_input) {
     DCHECK_EQ(func_id_, func_call.func_id);
     absl::MutexLock lk(&mu_);
+
+    // DEFENSIVE: Check if this is a duplicate request already being processed
+    if (assigned_workers_.contains(func_call.full_call_id)) {
+        HLOG(WARNING) << fmt::format("Dispatcher: OnNewFuncCall: Ignoring duplicate DISPATCH for call_id={} (already assigned to worker)",
+                               func_call.call_id);
+        return false;
+    }
 
     VLOG(1) << fmt::format("OnNewFuncCall: input_size={}, total_workers={}, idle={}, running={}, pending={}",
                               input_size, workers_.size(), idle_workers_.size(),

@@ -137,6 +137,31 @@ void IOWorker::ScheduleFunction(ConnectionBase* owner, std::function<void()> fn)
     UV_DCHECK_OK(uv_async_send(&run_fn_event_));
 }
 
+void IOWorker::StartIdle(uv_idle_t* idle, uv_idle_cb cb, void* data) {
+    auto init_start = [this, idle, cb, data]() {
+        UV_DCHECK_OK(uv_idle_init(&uv_loop_, idle));
+        idle->data = data;
+        UV_DCHECK_OK(uv_idle_start(idle, cb));
+    };
+    if (uv::WithinEventLoop(&uv_loop_)) {
+        init_start();
+    } else {
+        ScheduleFunction(/*owner=*/nullptr, init_start);
+    }
+}
+
+void IOWorker::StopIdle(uv_idle_t* idle) {
+    auto stop_close = [idle]() {
+        uv_idle_stop(idle);
+        uv_close(UV_AS_HANDLE(idle), nullptr);
+    };
+    if (uv::WithinEventLoop(&uv_loop_)) {
+        stop_close();
+    } else {
+        ScheduleFunction(/*owner=*/nullptr, stop_close);
+    }
+}
+
 void IOWorker::OnConnectionClose(ConnectionBase* connection) {
     DCHECK_IN_EVENT_LOOP_THREAD(&uv_loop_);
     DCHECK(pipe_to_server_.loop == &uv_loop_);

@@ -45,6 +45,10 @@ public:
     // if it is closed.
     void ScheduleFunction(ConnectionBase* owner, std::function<void()> fn);
 
+    // Start/stop an uv_idle_t on this IO worker's event loop
+    void StartIdle(uv_idle_t* idle, uv_idle_cb cb, void* data);
+    void StopIdle(uv_idle_t* idle);
+
 private:
     enum State { kCreated, kRunning, kStopping, kStopped };
 

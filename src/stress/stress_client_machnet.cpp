@@ -197,7 +197,7 @@ void MachnetStressTransport::SendThreadMain() {
       func_call.method_id = config_.method_id;
     }
     GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
-    message.payload_size = config_.input_size;
+    // message.payload_size = config_.input_size;
 
     // Record send timestamp for latency calculation
     size_t idx = static_cast<size_t>(call_id - base_call_id_start_);
@@ -205,8 +205,8 @@ void MachnetStressTransport::SendThreadMain() {
       send_ts_by_index_[idx] = now;
     }
 
-    bool success = machnet_single_conn_->SendMessage(
-        message, std::span<const char>(input_buffer_.data(), input_buffer_.size()));
+    bool success = machnet_single_conn_->SendMessage(message, {});
+        // message, std::span<const char>(input_buffer_.data(), input_buffer_.size()));
     if (success) {
       sent_count_.fetch_add(1, std::memory_order_relaxed);
     }

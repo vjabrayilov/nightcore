@@ -85,7 +85,7 @@ private:
     std::string machnet_ip_;
     std::string gateway_machnet_ip_;
     std::vector<std::unique_ptr<machnet::MachnetConnection>> machnet_connections_;
-    uv_idle_t machnet_poll_idle_;  // Idle callback for continuous polling
+    std::vector<uv_idle_t> machnet_poll_idles_;  // Per-IOWorker Machnet polling
     std::atomic<size_t> next_machnet_conn_idx_;
 
     uv_stream_t* uv_handle_;
@@ -139,8 +139,6 @@ private:
     void OnRecvMachnetGatewayMessage(const protocol::GatewayMessage& message,
                                       std::span<const char> payload);
     machnet::MachnetConnection* PickMachnetGatewayConnection();
-    static void MachnetPollCallback(uv_idle_t* handle);
-    void DoMachnetPoll();  // Actual polling logic
 
     DECLARE_UV_CONNECT_CB_FOR_CLASS(GatewayConnect);
     DECLARE_UV_CONNECTION_CB_FOR_CLASS(MessageConnection);

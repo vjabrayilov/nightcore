@@ -1,6 +1,7 @@
 #include "common/machnet_transport.h"
 
 #include <cstring>
+#include <string>
 
 namespace faas {
 namespace machnet {
@@ -151,6 +152,7 @@ void MachnetListener::TryPoll() {
         if (new_connection_callback_) {
             new_connection_callback_(conn);
         }
+        std::cerr << "New Machnet connection created: " << flow.src_ip << ":" << flow.src_port << " -> " << flow.dst_ip << ":" << flow.dst_port << std::endl;
     } else {
         conn = it->second.get();
     }
@@ -191,7 +193,7 @@ void MachnetListener::Poll() {
             auto new_conn = std::make_unique<MachnetConnection>(channel_, send_flow);
             conn = new_conn.get();
             connections_[flow_id] = std::move(new_conn);
-
+            std::cerr << "New Machnet connection created: " << flow.src_ip << ":" << flow.src_port << " -> " << flow.dst_ip << ":" << flow.dst_port << std::endl;
             if (new_connection_callback_) {
                 new_connection_callback_(conn);
             }
@@ -232,6 +234,7 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
         int ret = machnet_send(channel_, flow_, &message, sizeof(protocol::GatewayMessage));
         if (ret != 0) {
             // Silently fail - logging not safe on this thread
+            std::cerr << "ERROR: machnet_send() failed with error: " << ret << std::endl;
             return false;
         }
     } else {
@@ -293,12 +296,21 @@ void MachnetConnection::ProcessMessages() {
 
         if (read_buffer_.length() >= full_size) {
             // Complete message available
-            std::span<const char> payload(
-                read_buffer_.data() + sizeof(protocol::GatewayMessage),
-                full_size - sizeof(protocol::GatewayMessage));
+            const size_t payload_size = full_size - sizeof(protocol::GatewayMessage);
+
+            // Copy header and payload into owning storage to avoid dangling views
+            protocol::GatewayMessage header_copy = *message;
+            std::string payload_copy;
+            payload_copy.resize(payload_size);
+            if (payload_size > 0) {
+                std::memcpy(payload_copy.data(),
+                            read_buffer_.data() + sizeof(protocol::GatewayMessage),
+                            payload_size);
+            }
 
             if (message_callback_) {
-                message_callback_(*message, payload);
+                std::span<const char> payload_view(payload_copy.data(), payload_copy.size());
+                message_callback_(header_copy, payload_view);
             }
             // Silently ignore if no callback set
 
