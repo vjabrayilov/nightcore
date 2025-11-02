@@ -274,6 +274,9 @@ void MachnetStressTransport::ReceiveThreadMain() {
   std::cerr << "[Receive Thread " << std::this_thread::get_id()
             << "] Machnet listener created" << std::endl;
 
+  // Enforce single-connection behavior: after first flow, ignore any new ones
+  machnet_listener_->SetSingleConnectionOnly(true);
+
   machnet_listener_->SetNewConnectionCallback(
       [this](machnet::MachnetConnection* conn) {
         OnNewMachnetConnection(conn);

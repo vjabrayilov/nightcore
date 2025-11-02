@@ -138,6 +138,10 @@ void MachnetListener::TryPoll() {
     auto it = connections_.find(flow_id);
 
     if (it == connections_.end()) {
+        if (single_connection_only_ && !connections_.empty()) {
+            // Drop messages from additional flows in single-connection mode
+            return;
+        }
         // New connection from a remote peer; swap for sending
         MachnetFlow_t send_flow;
         send_flow.src_ip = flow.dst_ip;
@@ -183,6 +187,10 @@ void MachnetListener::Poll() {
         auto it = connections_.find(flow_id);
 
         if (it == connections_.end()) {
+            if (single_connection_only_ && !connections_.empty()) {
+                // Drop messages from additional flows in single-connection mode
+                continue;
+            }
             // New connection from a remote peer; swap for sending
             MachnetFlow_t send_flow;
             send_flow.src_ip = flow.dst_ip;

@@ -95,6 +95,10 @@ public:
     // Try to poll for incoming messages
     void TryPoll();
 
+    // When enabled, only the first new flow creates a connection; subsequent
+    // flows are ignored (their messages are dropped) to keep a single send flow.
+    void SetSingleConnectionOnly(bool enable) { single_connection_only_ = enable; }
+
     const std::string& local_ip() const { return local_ip_; }
     uint16_t port() const { return port_; }
 
@@ -106,6 +110,9 @@ private:
 
     // Track active connections by flow (owns the connection objects)
     std::unordered_map<uint64_t, std::unique_ptr<MachnetConnection>> connections_;
+
+    // If true, ignore new flows after the first connection is created.
+    bool single_connection_only_ = false;
 
     friend class MachnetChannel;
     friend class MachnetConnection;
