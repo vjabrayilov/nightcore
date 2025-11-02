@@ -169,10 +169,9 @@ void MachnetListener::TryPoll() {
 
 void MachnetListener::Poll() {
     // Poll for incoming messages from any flow and drain immediately
-    constexpr size_t kBufferSize = 65536;
-    static char buffer[kBufferSize];
-
-    for (;;) {
+    while (true) {
+        constexpr size_t kBufferSize = 65536;
+        char buffer[kBufferSize];
         MachnetFlow_t flow;
         ssize_t ret = machnet_recv(channel_, buffer, kBufferSize, &flow);
         if (ret <= 0) {
@@ -242,6 +241,7 @@ bool MachnetConnection::SendMessage(const protocol::GatewayMessage& message,
         int ret = machnet_send(channel_, flow_, &message, sizeof(protocol::GatewayMessage));
         if (ret != 0) {
             // Silently fail - logging not safe on this thread
+            std::cerr<<"Flow src: "<<flow_.src_ip<<" port: "<<flow_.src_port<<" dst_ip: "<<flow_.dst_ip<<" port: "<<flow_.dst_port<<std::endl;
             std::cerr << "ERROR: machnet_send() failed with error: " << ret << std::endl;
             return false;
         }
