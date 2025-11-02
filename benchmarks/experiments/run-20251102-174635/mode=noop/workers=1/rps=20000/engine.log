@@ -1,0 +1,29 @@
+I1102 17:46:56.454276 Main     thread.cpp:100] Register main thread: tid=1365339
+E1102 17:46:56.454506 Main     docker.cpp:59] Cannot find docker's cgroup in /proc/self/cgroup
+I1102 17:46:56.454563 Main     func_config.cpp:135] Load configuration for function Noop[1]
+I1102 17:46:56.454573 Main     engine.cpp:109] Engine: Start 1 IO workers
+I1102 17:46:56.457786 IO-0/EL  thread.cpp:40] Start thread: IO-0/EL
+I1102 17:46:56.457834 IO-0/EL  io_worker.cpp:192] IO-0: Event loop starts
+Checking for file descriptor...
+Got a file descriptor!
+I1102 17:46:58.349012 Main     engine.cpp:180] Engine: Created 1 Machnet connections to Gateway at 10.10.1.2:10007
+I1102 17:46:58.349112 Main     engine.cpp:208] Engine: Listen on /dev/shm/faas_ipc/engine.sock for IPC connections
+I1102 17:46:58.349305 Server/E thread.cpp:40] Start thread: Server/EL
+I1102 17:46:58.349427 Server/E server_base.cpp:50] Server: Event loop starts
+I1102 17:46:58.458290 Server/E engine.cpp:674] Engine: New message connection
+I1102 17:46:58.461486 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Read]: Allocate new buffer, current buffer count is 1
+I1102 17:46:58.461516 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 17:46:58.461522 IO-0/EL  worker_manager.cpp:23] WorkerManager: Launcher of func_id 1 connected
+I1102 17:46:58.461526 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 1
+I1102 17:46:58.461564 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 1
+I1102 17:46:58.461575 IO-0/EL  message_connection.cpp:269] LauncherConnection[1]: Handshake done
+I1102 17:46:58.465838 Server/E engine.cpp:674] Engine: New message connection
+I1102 17:46:58.465876 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 17:46:58.465882 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 1 connected
+I1102 17:46:58.465893 IO-0/EL  dispatcher.cpp:47] Dispatcher[1]: min_workers=1
+I1102 17:46:58.465897 IO-0/EL  dispatcher.cpp:51] Dispatcher[1]: max_workers=1
+I1102 17:46:58.465918 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-1]: Handshake done
+I1102 17:47:06.382561 Main     server_base.cpp:35] Server: Scheduled to stop
+I1102 17:47:06.382694 IO-0/EL  message_connection.cpp:284] LauncherConnection[1]: Connection closed remotely
+I1102 17:47:06.382754 Server/E server_base.cpp:109] Server: Start stopping process
+I1102 17:47:06.382820 IO-0/EL  io_worker.cpp:206] IO-0: Start stopping process

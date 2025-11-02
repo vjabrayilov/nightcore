@@ -1,0 +1,7 @@
+I1102 19:14:14.600117 Main     thread.cpp:100] Register main thread: tid=1405327
+I1102 19:14:14.600192 Main     func_worker.cpp:51] My client_id is 168
+I1102 19:14:14.600347 Main     func_config.cpp:135] Load configuration for function Echo[1]
+I1102 19:14:14.600371 Main     func_worker.cpp:118] Use extra pipes for messages
+I1102 19:14:14.619008 Main     func_worker.cpp:137] Handshake done
+F1102 19:14:22.419212 Main     func_worker.cpp:100] Check failed: io_utils::RecvMessage(input_pipe_fd_, &message, nullptr) Failed to receive message from engine
+*** SIGABRT received at time=1762110862 on cpu 9 ***

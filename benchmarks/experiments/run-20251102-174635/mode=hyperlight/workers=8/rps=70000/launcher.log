@@ -1,0 +1,24 @@
+I1102 18:49:35.420288 Main     thread.cpp:100] Register main thread: tid=1389026
+E1102 18:49:35.420436 Main     docker.cpp:59] Cannot find docker's cgroup in /proc/self/cgroup
+I1102 18:49:35.423651 Launcher thread.cpp:40] Start thread: Launcher/EL
+I1102 18:49:35.423699 Launcher thread.cpp:64] Does not find cpuset setting for IO threads (can be set by FAAS_IO_THREAD_CPUSET)
+I1102 18:49:35.423704 Launcher thread.cpp:82] Does not find nice setting for IO threads (can be set by FAAS_IO_THREAD_NICE)
+I1102 18:49:35.423712 Launcher launcher.cpp:96] Launcher: Event loop starts
+I1102 18:49:35.423733 Launcher engine_connection.cpp:93] EngineConnection: Connected to engine, start writing handshake message
+I1102 18:49:35.423902 Launcher buffer_pool.h:25] BufferPool[Launcher]: Allocate new buffer, current buffer count is 1
+I1102 18:49:35.423928 Launcher func_config.cpp:135] Load configuration for function Echo[1]
+I1102 18:49:35.423938 Launcher engine_connection.cpp:65] EngineConnection: Handshake done
+W1102 18:49:35.431599 Launcher engine_connection.cpp:166] EngineConnection: nread=0, will do nothing
+I1102 18:49:43.493888 Main     launcher.cpp:44] Launcher: Scheduled to stop
+E1102 18:49:43.494183 Launcher launcher.cpp:72] Launcher: Connection to engine disconnected
+I1102 18:49:43.494228 Launcher launcher.cpp:44] Launcher: Scheduled to stop
+W1102 18:49:43.516199 Launcher launcher.cpp:87] Launcher: Function process 0 terminated
+W1102 18:49:43.533367 Launcher launcher.cpp:87] Launcher: Function process 5 terminated
+W1102 18:49:43.533380 Launcher launcher.cpp:87] Launcher: Function process 4 terminated
+W1102 18:49:43.533385 Launcher launcher.cpp:87] Launcher: Function process 3 terminated
+W1102 18:49:43.533390 Launcher launcher.cpp:87] Launcher: Function process 2 terminated
+W1102 18:49:43.533395 Launcher launcher.cpp:87] Launcher: Function process 1 terminated
+W1102 18:49:43.533434 Launcher launcher.cpp:87] Launcher: Function process 6 terminated
+W1102 18:49:43.533572 Launcher launcher.cpp:87] Launcher: Function process 7 terminated
+I1102 18:49:43.533579 Launcher launcher.cpp:101] Launcher: Event loop finishes
+I1102 18:49:43.533623 Main     launcher.cpp:68] Launcher: Stopped

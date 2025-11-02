@@ -1,0 +1,57 @@
+I1102 18:22:53.141666 Main     thread.cpp:100] Register main thread: tid=1136801
+I1102 18:22:53.141737 Main     stress_client.cpp:179] Using Machnet transport on 10.10.1.2:10007
+I1102 18:22:53.141742 Main     stress_client_machnet.cpp:37] Starting Machnet event-loop thread...
+[Loop Thread 131642905589440] Machnet event-loop thread started
+I1102 18:22:53.144991 Server/E thread.cpp:40] Start thread: Server/EL
+I1102 18:22:53.145024 Server/E server_base.cpp:50] Server: Event loop starts
+Checking for file descriptor...
+Got a file descriptor!
+I1102 18:22:53.645106 Main     stress_client.cpp:43] === Nightcore Stress Test ===
+I1102 18:22:53.645163 Main     stress_client.cpp:44] Function ID: 1
+I1102 18:22:53.645171 Main     stress_client.cpp:45] Method ID: 0
+I1102 18:22:53.645175 Main     stress_client.cpp:46] Input size: 64 bytes
+I1102 18:22:53.645180 Main     stress_client.cpp:47] Global target RPS: 30000
+I1102 18:22:53.645185 Main     stress_client.cpp:50] Inflight limit per connection: 1
+I1102 18:22:53.645189 Main     stress_client.cpp:51] Warmup: 0s, Duration: 5s
+I1102 18:22:53.645194 Main     stress_client.cpp:53] 
+I1102 18:22:53.645199 Main     stress_client.cpp:54] ========================================
+I1102 18:22:53.645203 Main     stress_client.cpp:57] Waiting for Engine to connect...
+Listening on Machnet 10.10.1.2:10007 for Engine connections[Loop Thread 131642905589440] Machnet listener created
+New Machnet connection created: 168427777:1024 -> 168427778:10007
+[Receive Thread 131642905589440] Handshake: pinned send flow 168427778:10007 -> 168427777:1024
+[Loop Thread 131642905589440] Now sending on flow 168427778:10007 -> 168427777:1024
+I1102 18:22:57.448813 Main     stress_client.cpp:71] Engine connected with 1 connection(s)
+I1102 18:22:57.448850 Main     stress_client.cpp:73] Global target RPS: 30000
+I1102 18:22:57.448857 Main     stress_client.cpp:76] 
+I1102 18:22:57.448861 Main     stress_client.cpp:79] Waiting 3 seconds for workers to initialize...
+I1102 18:23:01.450894 Main     stress_common.cpp:30] [T+1s] Sent: 30306 | Completed: 30305 | Failed: 0 | Latencies: 30305
+I1102 18:23:02.451790 Main     stress_common.cpp:30] [T+2s] Sent: 60618 | Completed: 60617 | Failed: 0 | Latencies: 60617
+I1102 18:23:03.452334 Main     stress_common.cpp:30] [T+3s] Sent: 90926 | Completed: 90925 | Failed: 0 | Latencies: 90925
+I1102 18:23:04.452916 Main     stress_common.cpp:30] [T+4s] Sent: 121231 | Completed: 121231 | Failed: 0 | Latencies: 121231
+I1102 18:23:05.453552 Main     stress_common.cpp:30] [T+5s] Sent: 151415 | Completed: 151415 | Failed: 0 | Latencies: 150000
+I1102 18:23:05.453586 Main     stress_client.cpp:116] 
+I1102 18:23:05.453809 Main     stress_common.cpp:42] ========================================
+I1102 18:23:05.453816 Main     stress_common.cpp:43] === Stress Test Results ===
+I1102 18:23:05.453821 Main     stress_common.cpp:44] ========================================
+I1102 18:23:05.453825 Main     stress_common.cpp:45] Transport:         Machnet
+I1102 18:23:05.453831 Main     stress_common.cpp:46] Connections:       1
+I1102 18:23:05.453837 Main     stress_common.cpp:47] Duration:          5.00 seconds
+I1102 18:23:05.453864 Main     stress_common.cpp:48] Total Sent:        151415
+I1102 18:23:05.453869 Main     stress_common.cpp:49] Total Completed:   151415 (100.00%)
+I1102 18:23:05.453875 Main     stress_common.cpp:52] Total Failed:      0 (0.00%)
+I1102 18:23:05.453881 Main     stress_common.cpp:55] 
+I1102 18:23:05.453886 Main     stress_common.cpp:56] Throughput:        30264.0 rps
+I1102 18:23:05.453892 Main     stress_common.cpp:57] 
+I1102 18:23:05.465200 Main     stress_common.cpp:71] Latency (us):
+I1102 18:23:05.465214 Main     stress_common.cpp:72]   Min:    18
+I1102 18:23:05.465221 Main     stress_common.cpp:73]   p50:    28
+I1102 18:23:05.465227 Main     stress_common.cpp:74]   p90:    29
+I1102 18:23:05.465231 Main     stress_common.cpp:75]   p99:    35
+I1102 18:23:05.465235 Main     stress_common.cpp:76]   p99.9:  70
+I1102 18:23:05.465240 Main     stress_common.cpp:77]   Max:    702
+I1102 18:23:05.465245 Main     stress_common.cpp:82] ========================================
+I1102 18:23:05.465250 Main     server_base.cpp:35] Server: Scheduled to stop
+I1102 18:23:05.465373 Server/E server_base.cpp:109] Server: Start stopping process
+[Loop Thread 131642905589440] Machnet event-loop thread finished
+I1102 18:23:05.465476 Server/E server_base.cpp:55] Server: Event loop finishes
+I1102 18:23:05.465602 Main     server_base.cpp:46] Server: Stopped

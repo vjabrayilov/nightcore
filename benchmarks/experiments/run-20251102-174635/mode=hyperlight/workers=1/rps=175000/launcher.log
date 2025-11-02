@@ -1,0 +1,16 @@
+I1102 18:35:59.455764 Main     thread.cpp:100] Register main thread: tid=1385658
+E1102 18:35:59.455903 Main     docker.cpp:59] Cannot find docker's cgroup in /proc/self/cgroup
+I1102 18:35:59.459122 Launcher thread.cpp:40] Start thread: Launcher/EL
+I1102 18:35:59.459168 Launcher thread.cpp:64] Does not find cpuset setting for IO threads (can be set by FAAS_IO_THREAD_CPUSET)
+I1102 18:35:59.459174 Launcher thread.cpp:82] Does not find nice setting for IO threads (can be set by FAAS_IO_THREAD_NICE)
+I1102 18:35:59.459178 Launcher launcher.cpp:96] Launcher: Event loop starts
+I1102 18:35:59.459197 Launcher engine_connection.cpp:93] EngineConnection: Connected to engine, start writing handshake message
+I1102 18:35:59.459279 Launcher buffer_pool.h:25] BufferPool[Launcher]: Allocate new buffer, current buffer count is 1
+I1102 18:35:59.459306 Launcher func_config.cpp:135] Load configuration for function Echo[1]
+I1102 18:35:59.459319 Launcher engine_connection.cpp:65] EngineConnection: Handshake done
+I1102 18:36:07.414260 Main     launcher.cpp:44] Launcher: Scheduled to stop
+E1102 18:36:07.414444 Launcher launcher.cpp:72] Launcher: Connection to engine disconnected
+I1102 18:36:07.414537 Launcher launcher.cpp:44] Launcher: Scheduled to stop
+W1102 18:36:07.441165 Launcher launcher.cpp:87] Launcher: Function process 0 terminated
+I1102 18:36:07.441184 Launcher launcher.cpp:101] Launcher: Event loop finishes
+I1102 18:36:07.441234 Main     launcher.cpp:68] Launcher: Stopped

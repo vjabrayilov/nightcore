@@ -1,0 +1,45 @@
+I1102 18:42:45.508354 Main     thread.cpp:100] Register main thread: tid=1387251
+E1102 18:42:45.508593 Main     docker.cpp:59] Cannot find docker's cgroup in /proc/self/cgroup
+I1102 18:42:45.508650 Main     func_config.cpp:135] Load configuration for function Echo[1]
+I1102 18:42:45.508661 Main     engine.cpp:109] Engine: Start 1 IO workers
+I1102 18:42:45.511920 IO-0/EL  thread.cpp:40] Start thread: IO-0/EL
+I1102 18:42:45.511966 IO-0/EL  io_worker.cpp:192] IO-0: Event loop starts
+Checking for file descriptor...
+Got a file descriptor!
+I1102 18:42:47.361243 Main     engine.cpp:180] Engine: Created 1 Machnet connections to Gateway at 10.10.1.2:10007
+I1102 18:42:47.361295 Main     engine.cpp:208] Engine: Listen on /dev/shm/faas_ipc/engine.sock for IPC connections
+I1102 18:42:47.361447 Server/E thread.cpp:40] Start thread: Server/EL
+I1102 18:42:47.361500 Server/E server_base.cpp:50] Server: Event loop starts
+I1102 18:42:47.508364 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:42:47.511683 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Read]: Allocate new buffer, current buffer count is 1
+I1102 18:42:47.511718 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:42:47.511724 IO-0/EL  worker_manager.cpp:23] WorkerManager: Launcher of func_id 1 connected
+I1102 18:42:47.511728 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 1
+I1102 18:42:47.511748 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 2
+I1102 18:42:47.511761 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 3
+I1102 18:42:47.511770 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 4
+I1102 18:42:47.511795 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 1
+I1102 18:42:47.511806 IO-0/EL  message_connection.cpp:269] LauncherConnection[1]: Handshake done
+I1102 18:42:47.515947 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:42:47.515975 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:42:47.515980 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 1 connected
+I1102 18:42:47.515990 IO-0/EL  dispatcher.cpp:47] Dispatcher[1]: min_workers=4
+I1102 18:42:47.515999 IO-0/EL  dispatcher.cpp:51] Dispatcher[1]: max_workers=4
+I1102 18:42:47.516022 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-1]: Handshake done
+I1102 18:42:47.516308 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:42:47.516328 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:42:47.516333 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 2 connected
+I1102 18:42:47.516347 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-2]: Handshake done
+I1102 18:42:47.518571 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:42:47.518600 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:42:47.518606 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 3 connected
+I1102 18:42:47.518620 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-3]: Handshake done
+I1102 18:42:47.519356 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:42:47.519378 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:42:47.519383 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 4 connected
+I1102 18:42:47.519396 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-4]: Handshake done
+I1102 18:42:53.691524 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 2
+I1102 18:42:55.424125 Main     server_base.cpp:35] Server: Scheduled to stop
+I1102 18:42:55.424176 Server/E server_base.cpp:109] Server: Start stopping process
+I1102 18:42:55.424205 IO-0/EL  io_worker.cpp:206] IO-0: Start stopping process
+I1102 18:42:55.424229 Server/E server_base.cpp:55] Server: Event loop finishes

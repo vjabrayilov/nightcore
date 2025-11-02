@@ -1,0 +1,47 @@
+I1102 18:45:52.454246 Main     thread.cpp:100] Register main thread: tid=1388056
+E1102 18:45:52.454505 Main     docker.cpp:59] Cannot find docker's cgroup in /proc/self/cgroup
+I1102 18:45:52.454558 Main     func_config.cpp:135] Load configuration for function Echo[1]
+I1102 18:45:52.454570 Main     engine.cpp:109] Engine: Start 1 IO workers
+I1102 18:45:52.457786 IO-0/EL  thread.cpp:40] Start thread: IO-0/EL
+I1102 18:45:52.457832 IO-0/EL  io_worker.cpp:192] IO-0: Event loop starts
+Checking for file descriptor...
+Got a file descriptor!
+I1102 18:45:54.361874 Main     engine.cpp:180] Engine: Created 1 Machnet connections to Gateway at 10.10.1.2:10007
+I1102 18:45:54.361988 Main     engine.cpp:208] Engine: Listen on /dev/shm/faas_ipc/engine.sock for IPC connections
+I1102 18:45:54.362248 Server/E thread.cpp:40] Start thread: Server/EL
+I1102 18:45:54.362300 Server/E server_base.cpp:50] Server: Event loop starts
+I1102 18:45:54.455772 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:45:54.459079 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Read]: Allocate new buffer, current buffer count is 1
+I1102 18:45:54.459104 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:45:54.459109 IO-0/EL  worker_manager.cpp:23] WorkerManager: Launcher of func_id 1 connected
+I1102 18:45:54.459112 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 1
+I1102 18:45:54.459127 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 2
+I1102 18:45:54.459136 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 3
+I1102 18:45:54.459143 IO-0/EL  worker_manager.cpp:131] WorkerManager: Request new FuncWorker for func_id 1 with client_id 4
+I1102 18:45:54.459163 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 1
+I1102 18:45:54.459172 IO-0/EL  message_connection.cpp:269] LauncherConnection[1]: Handshake done
+I1102 18:45:54.462740 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:45:54.462768 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:45:54.462772 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 1 connected
+I1102 18:45:54.462781 IO-0/EL  dispatcher.cpp:47] Dispatcher[1]: min_workers=4
+I1102 18:45:54.462787 IO-0/EL  dispatcher.cpp:51] Dispatcher[1]: max_workers=4
+I1102 18:45:54.462807 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-1]: Handshake done
+I1102 18:45:54.464876 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:45:54.464902 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:45:54.464908 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 2 connected
+I1102 18:45:54.464921 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-2]: Handshake done
+I1102 18:45:54.465295 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:45:54.465320 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:45:54.465324 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 3 connected
+I1102 18:45:54.465336 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-3]: Handshake done
+I1102 18:45:54.468308 Server/E engine.cpp:674] Engine: New message connection
+I1102 18:45:54.468330 IO-0/EL  engine.cpp:277] Engine: Receive new handshake message from message connection
+I1102 18:45:54.468334 IO-0/EL  worker_manager.cpp:60] WorkerManager: FuncWorker of func_id 1, client_id 4 connected
+I1102 18:45:54.468345 IO-0/EL  message_connection.cpp:269] FuncWorkerConnection[1-4]: Handshake done
+I1102 18:45:57.390936 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 2
+I1102 18:45:57.390962 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 3
+I1102 18:45:57.390973 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 4
+I1102 18:45:58.177983 IO-0/EL  buffer_pool.h:25] BufferPool[IO-0_Write]: Allocate new buffer, current buffer count is 5
+I1102 18:46:02.472193 Main     server_base.cpp:35] Server: Scheduled to stop
+I1102 18:46:02.472382 Server/E server_base.cpp:109] Server: Start stopping process
+I1102 18:46:02.472450 IO-0/EL  io_worker.cpp:206] IO-0: Start stopping process

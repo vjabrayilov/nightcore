@@ -1,0 +1,7 @@
+I1102 18:25:47.652583 Main     thread.cpp:100] Register main thread: tid=1377990
+I1102 18:25:47.652654 Main     func_worker.cpp:51] My client_id is 52
+I1102 18:25:47.652736 Main     func_config.cpp:135] Load configuration for function Noop[1]
+I1102 18:25:47.652760 Main     func_worker.cpp:118] Use extra pipes for messages
+I1102 18:25:47.652849 Main     func_worker.cpp:137] Handshake done
+F1102 18:25:55.552074 Main     func_worker.cpp:100] Check failed: io_utils::RecvMessage(input_pipe_fd_, &message, nullptr) Failed to receive message from engine
+*** SIGABRT received at time=1762107955 on cpu 7 ***

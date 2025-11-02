@@ -1,0 +1,9 @@
+I1102 19:16:30.685105 Main     thread.cpp:100] Register main thread: tid=1409932
+I1102 19:16:30.685176 Main     func_worker.cpp:51] My client_id is 122
+I1102 19:16:30.685333 Main     func_config.cpp:135] Load configuration for function Echo[1]
+I1102 19:16:30.685357 Main     func_worker.cpp:118] Use extra pipes for messages
+I1102 19:16:30.685416 Main     func_worker.cpp:137] Handshake done
+F1102 19:16:38.531257 Main     func_worker.cpp:100] Check failed: io_utils::RecvMessage(input_pipe_fd_, &message, nullptr) Failed to receive message from engine
+*** SIGABRT received at time=1762110998 on cpu 15 ***
+[symbolize_elf.inc : 378] RAW: Unable to get high fd: rc=0, limit=1024
+PC: @     0x7c26b229eb2c  (unknown)  pthread_kill

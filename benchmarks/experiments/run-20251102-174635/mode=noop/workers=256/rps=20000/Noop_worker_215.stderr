@@ -1,0 +1,8 @@
+I1102 18:27:46.650065 Main     thread.cpp:100] Register main thread: tid=1379620
+I1102 18:27:46.650134 Main     func_worker.cpp:51] My client_id is 216
+I1102 18:27:46.650207 Main     func_config.cpp:135] Load configuration for function Noop[1]
+I1102 18:27:46.650231 Main     func_worker.cpp:118] Use extra pipes for messages
+I1102 18:27:46.650295 Main     func_worker.cpp:137] Handshake done
+F1102 18:27:54.445495 Main     func_worker.cpp:100] Check failed: io_utils::RecvMessage(input_pipe_fd_, &message, nullptr) Failed to receive message from engine
+*** SIGABRT received at time=1762108074 on cpu 30 ***
+[symbolize_elf.inc : 378] RAW: Unable to get high fd: rc=0, limit=1024
