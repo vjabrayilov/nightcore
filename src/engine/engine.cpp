@@ -707,7 +707,8 @@ void Engine::OnRecvMachnetGatewayMessage(const GatewayMessage& message,
         VLOG(1) << fmt::format("Machnet dispatch: func_id={}, call_id={:#x}, payload={} bytes",
                                   static_cast<uint16_t>(func_call.func_id),
                                   func_call.full_call_id, payload.size());
-        OnExternalFuncCall(func_call, payload);
+        // OnExternalFuncCall(func_call, payload);
+        ExternalFuncCallCompleted(func_call, payload, 0);
     } else {
         HLOG(WARNING) << fmt::format("Unknown Machnet gateway message type: "
                                      "message_type={}, func_id={}, call_id={}, payload={} bytes",
