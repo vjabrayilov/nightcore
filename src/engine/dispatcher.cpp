@@ -107,20 +107,21 @@ bool Dispatcher::OnNewFuncCall(const FuncCall& func_call, const FuncCall& parent
         SetInlineDataInMessage(dispatch_func_call_message, inline_input);
     }
 
-    Tracer::FuncCallInfo* func_call_info = engine_->tracer()->OnNewFuncCall(
-        func_call, parent_func_call, input_size);
-    FuncWorker* idle_worker = PickIdleWorker();
-    if (idle_worker) {
-        VLOG(1) << fmt::format("Dispatching to worker client_id={}", idle_worker->client_id());
-        DispatchFuncCall(idle_worker, dispatch_func_call_message);
-    } else {
-        VLOG(1) << fmt::format("No idle worker! Queuing request (pending_count={})",
-                                     pending_func_calls_.size() + 1);
-        pending_func_calls_.push({
-            .dispatch_func_call_message = dispatch_func_call_message,
-            .func_call_info = func_call_info
-        });
-    }
+    // Tracer::FuncCallInfo* func_call_info = engine_->tracer()->OnNewFuncCall(
+        // func_call, parent_func_call, input_size);
+    // FuncWorker* idle_worker = PickIdleWorker();
+    // if (idle_worker) {
+    //     VLOG(1) << fmt::format("Dispatching to worker client_id={}", idle_worker->client_id());
+    //     DispatchFuncCall(idle_worker, dispatch_func_call_message);
+    // } else {
+    //     VLOG(1) << fmt::format("No idle worker! Queuing request (pending_count={})",
+    //                                  pending_func_calls_.size() + 1);
+    //     pending_func_calls_.push({
+    //         .dispatch_func_call_message = dispatch_func_call_message,
+    //         .func_call_info = func_call_info
+    //     });
+    // }
+    engine_->ExternalFuncCallCompleted(func_call, {}, 0);
     return true;
 }
 

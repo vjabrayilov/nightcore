@@ -63,6 +63,8 @@ public:
                               std::span<const char> payload);
     Dispatcher* GetOrCreateDispatcher(uint16_t func_id);
     void DiscardFuncCall(const protocol::FuncCall& func_call);
+    void ExternalFuncCallCompleted(const protocol::FuncCall& func_call,
+                                   std::span<const char> output, int32_t processing_time);
 
 private:
     class ExternalFuncCallContext;
@@ -126,8 +128,6 @@ private:
     void OnConnectionClose(server::ConnectionBase* connection) override;
 
     void OnExternalFuncCall(const protocol::FuncCall& func_call, std::span<const char> input);
-    void ExternalFuncCallCompleted(const protocol::FuncCall& func_call,
-                                   std::span<const char> output, int32_t processing_time);
     void ExternalFuncCallFailed(const protocol::FuncCall& func_call, int status_code = 0);
 
     Dispatcher* GetOrCreateDispatcherLocked(uint16_t func_id) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_);
