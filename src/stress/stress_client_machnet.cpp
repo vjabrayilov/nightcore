@@ -55,10 +55,15 @@ void MachnetStressTransport::EnableSending() {
   // Initialize timing and scheduling for open-loop sending
   CHECK_GT(config_.target_rps, 0);
 
-  test_start_time_ = uv_hrtime() / 1000; // convert ns -> us
-  test_end_time_ = test_start_time_ + config_.duration_sec * 1000000LL;
-  inter_send_us_ = std::max<uint64_t>(1, 1000000LL / config_.target_rps);
-  next_send_time_ = test_start_time_;
+  // Keep all timing calculations in nanoseconds for precision
+  test_start_time_ns_ = uv_hrtime();
+  test_end_time_ns_ = test_start_time_ns_ + config_.duration_sec * 1000000000LL;
+  inter_send_ns_ = std::max<uint64_t>(1, 1000000000LL / config_.target_rps);
+  next_send_time_ns_ = test_start_time_ns_;
+  
+  // Reset measurement times (stored in microseconds)
+  measurement_start_time_.store(0, std::memory_order_relaxed);
+  measurement_end_time_.store(0, std::memory_order_relaxed);
 
   // Preallocate tracking for request timestamps and latencies
   base_call_id_start_ = call_id_alloc_->load(std::memory_order_relaxed);
@@ -223,14 +228,15 @@ void MachnetStressTransport::LoopThreadMain() {
       continue;
     }
 
-    uint64_t now = uv_hrtime() / 1000; // convert ns -> us
-    if (now >= test_end_time_) {
+    // All timing in nanoseconds for precision
+    uint64_t now_ns = uv_hrtime();
+    if (now_ns >= test_end_time_ns_) {
       sending_enabled_.store(false, std::memory_order_release);
       std::this_thread::sleep_for(std::chrono::microseconds(100));
       continue;
     }
 
-    if (now < next_send_time_) {
+    if (now_ns < next_send_time_ns_) {
       chan->Poll();
       continue;
     }
@@ -243,23 +249,31 @@ void MachnetStressTransport::LoopThreadMain() {
     }
     GatewayMessage message = NewDispatchFuncCallGatewayMessage(func_call);
 
+    // Convert to microseconds only for latency tracking storage
+    uint64_t now_us = now_ns / 1000;
     size_t idx = static_cast<size_t>(call_id - base_call_id_start_);
     if (idx < send_ts_by_index_.size()) {
-      send_ts_by_index_[idx] = now;
+      send_ts_by_index_[idx] = now_us;
     }
 
     bool success = conn->SendMessage(message, {});
     if (success) {
       sent_count_.fetch_add(1, std::memory_order_relaxed);
+      
+      // Track measurement window (store in microseconds for reporting)
+      if (warmup_done_.load(std::memory_order_acquire)) {
+        uint64_t expected = 0;
+        // Try to set start time if not already set (only once)
+        measurement_start_time_.compare_exchange_strong(expected, now_us, 
+                                                        std::memory_order_relaxed);
+        // Always update end time (will capture the last successful send)
+        measurement_end_time_.store(now_us, std::memory_order_relaxed);
+      }
     }
 
-    // Advance schedule (open-loop pacing with catch-up)
-    int64_t delta = (int64_t)now - (int64_t)next_send_time_;
-    int64_t intervals = 1 + (delta >= 0 ? (delta / (int64_t)inter_send_us_) : 0);
-    if (intervals < 1) intervals = 1;
-    next_send_time_ += (uint64_t)intervals * inter_send_us_;
-
-    chan->Poll();
+    // Advance schedule by exactly one interval (no catch-up)
+    // next_send_time_ns_ += inter_send_ns_;
+    next_send_time_ns_ = now_ns + inter_send_ns_;
   }
 
   std::cerr << "[Loop Thread " << std::this_thread::get_id()

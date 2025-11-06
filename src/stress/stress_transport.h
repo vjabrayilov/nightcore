@@ -38,6 +38,11 @@ public:
 
   // Check if transport should stop
   virtual bool ShouldStop() const = 0;
+  
+  // Get actual measurement window times for accurate throughput calculation
+  // Returns 0 if measurement hasn't started/ended yet
+  virtual uint64_t GetMeasurementStartTime() const { return 0; }
+  virtual uint64_t GetMeasurementEndTime() const { return 0; }
 };
 
 // Factory function to create appropriate transport

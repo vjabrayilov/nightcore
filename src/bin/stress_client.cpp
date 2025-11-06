@@ -92,8 +92,6 @@ public:
       transport_->EnableSending();
     }
 
-    uint64_t start_time = uv_hrtime() / 1000; // convert ns -> us
-
     // Test phase with periodic reporting
     for (int elapsed = 0;
          elapsed < config.duration_sec && !transport_->ShouldStop();
@@ -107,10 +105,19 @@ public:
       }
     }
 
-    uint64_t end_time = uv_hrtime() / 1000; // convert ns -> us
-
     // Disable sending
     transport_->DisableSending();
+
+    // Get actual measurement window times from transport for accurate throughput
+    uint64_t start_time = transport_->GetMeasurementStartTime();
+    uint64_t end_time = transport_->GetMeasurementEndTime();
+    
+    // Fallback to zero-based timing if transport doesn't provide measurement times
+    if (start_time == 0 || end_time == 0) {
+      // Use test duration as fallback
+      start_time = 0;
+      end_time = config.duration_sec * 1000000LL;
+    }
 
     // Print final results
     LOG(INFO) << "";
